@@ -1,51 +1,96 @@
 import { test, expect, describe, beforeAll } from "bun:test"
-import { OpenCodeIgnore } from "./index"
+import OpenCodeIgnore from "./index"
 import path from "path"
 
-// Test data directory is the project root for all tests
 const TEST_PROJECT_ROOT = path.join(process.cwd(), "test-data")
 
-// Helper to create plugin instance
-async function createPlugin(projectRoot = TEST_PROJECT_ROOT) {
-  return await OpenCodeIgnore({
-    project: {} as any,
-    client: {} as any,
-    $: {} as any,
-    directory: projectRoot,
-    worktree: projectRoot,
-  })
+interface BeforeEvent {
+  tool: string
+  input: Record<string, unknown>
+  sessionID: string
+  agent: string
+  messageID: string
+  id: string
 }
 
-// Helper to call hook
-async function callHook(hook: any, tool: string, args: any) {
-  return await hook(
-    { tool, sessionID: "test", callID: "test" },
-    { args }
-  )
+interface ToolResult {
+  output?: unknown
+  content?: string | readonly { type: string; text?: string }[]
+  metadata?: Record<string, unknown>
+}
+
+interface AfterEvent {
+  tool: string
+  input: Record<string, unknown>
+  status: "completed"
+  result: ToolResult
+}
+
+interface Hooks {
+  before: (event: BeforeEvent) => Promise<void> | void
+  after: (event: AfterEvent) => Promise<void> | void
+}
+
+async function createPlugin(projectRoot = TEST_PROJECT_ROOT): Promise<Hooks> {
+  const hooks: Partial<Hooks> = {}
+  await OpenCodeIgnore.setup({
+    location: { directory: projectRoot },
+    tool: {
+      hook: async (name: string, callback: (event: BeforeEvent | AfterEvent) => Promise<void> | void) => {
+        if (name === "execute.before") hooks.before = callback as Hooks["before"]
+        if (name === "execute.after") hooks.after = callback as Hooks["after"]
+      },
+    },
+  } as unknown as Parameters<typeof OpenCodeIgnore.setup>[0])
+
+  if (!hooks.before || !hooks.after) throw new Error("plugin did not register tool hooks")
+  return { before: hooks.before, after: hooks.after }
+}
+
+async function callAfter(hook: Hooks["after"], tool: string, input: Record<string, unknown>, result: ToolResult) {
+  const event: AfterEvent = { tool, input, status: "completed", result }
+  await hook(event)
+  return event.result
+}
+
+function textOf(content: ToolResult["content"]): string {
+  if (typeof content === "string") return content
+  if (!content) return ""
+  return content.map((part) => part.text ?? "").join("\n")
+}
+
+function callHook(hook: Hooks["before"], tool: string, input: Record<string, unknown>) {
+  return Promise.resolve(hook({
+    tool,
+    input,
+    sessionID: "test",
+    agent: "test",
+    messageID: "test",
+    id: "test",
+  }))
 }
 
 describe("OpenCodeIgnore Plugin", () => {
   test("plugin loads and registers hook", async () => {
-    const plugin = await createPlugin()
-    expect(plugin["tool.execute.before"]).toBeDefined()
-    expect(typeof plugin["tool.execute.before"]).toBe("function")
+    const hooks = await createPlugin()
+    expect(hooks.before).toBeDefined()
+    expect(typeof hooks.before).toBe("function")
+    expect(typeof hooks.after).toBe("function")
   })
 
   test("graceful degradation - missing ignore file allows all", async () => {
     const tempDir = "/tmp/test-no-ignore-" + Date.now()
-    const plugin = await createPlugin(tempDir)
-    const hook = plugin["tool.execute.before"]!
+    const hook = (await createPlugin(tempDir)).before
     
     // Should not throw even though no ignore file exists
-    expect(callHook(hook, "read", { filePath: "secrets.json" })).resolves.toBeUndefined()
+    expect(callHook(hook, "read", { path: "secrets.json" })).resolves.toBeUndefined()
   })
 
   test("project root (.) is always allowed", async () => {
-    const plugin = await createPlugin()
-    const hook = plugin["tool.execute.before"]!
+    const hook = (await createPlugin()).before
     
     // All directory operations on root should be allowed
-    expect(callHook(hook, "list", { path: "." })).resolves.toBeUndefined()
+    expect(callHook(hook, "read", { path: "." })).resolves.toBeUndefined()
     expect(callHook(hook, "glob", { path: "." })).resolves.toBeUndefined()
     expect(callHook(hook, "grep", { path: "." })).resolves.toBeUndefined()
   })
@@ -54,10 +99,9 @@ describe("OpenCodeIgnore Plugin", () => {
 describe("Ignore File Loading", () => {
   test("uses .ignore when available", async () => {
     // Current project has .ignore, should block secrets.json
-    const plugin = await createPlugin()
-    const hook = plugin["tool.execute.before"]!
+    const hook = (await createPlugin()).before
     
-    expect(callHook(hook, "read", { filePath: "secrets.json" }))
+    expect(callHook(hook, "read", { path: "secrets.json" }))
       .rejects.toThrow(/Access denied/)
   })
 
@@ -67,95 +111,90 @@ describe("Ignore File Loading", () => {
     // Create temp dir with .ignore
     await Bun.write(tempDir + "/.ignore", "blocked.txt\n")
     
-    const plugin = await createPlugin(tempDir)
-    const hook = plugin["tool.execute.before"]!
+    const hook = (await createPlugin(tempDir)).before
     
-    expect(callHook(hook, "read", { filePath: "blocked.txt" }))
+    expect(callHook(hook, "read", { path: "blocked.txt" }))
       .rejects.toThrow(/Access denied/)
-    expect(callHook(hook, "read", { filePath: "allowed.txt" }))
+    expect(callHook(hook, "read", { path: "allowed.txt" }))
       .resolves.toBeUndefined()
   })
 })
 
 describe("File I/O Tools Protection", () => {
-  let plugin: any
-  let hook: any
+  let hook: Hooks["before"]
 
   beforeAll(async () => {
-    plugin = await createPlugin()
-    hook = plugin["tool.execute.before"]
+    hook = (await createPlugin()).before
   })
 
   describe("read tool", () => {
     test("allows access to allowed files", async () => {
-      expect(callHook(hook, "read", { filePath: "index.ts" })).resolves.toBeUndefined()
-      expect(callHook(hook, "read", { filePath: "README.md" })).resolves.toBeUndefined()
+      expect(callHook(hook, "read", { path: "index.ts" })).resolves.toBeUndefined()
+      expect(callHook(hook, "read", { path: "README.md" })).resolves.toBeUndefined()
     })
 
     test("blocks secrets.json", async () => {
-      expect(callHook(hook, "read", { filePath: "secrets.json" }))
+      expect(callHook(hook, "read", { path: "secrets.json" }))
         .rejects.toThrow(/Access denied.*secrets\.json/)
     })
 
     test("blocks credentials.json", async () => {
-      expect(callHook(hook, "read", { filePath: "credentials.json" }))
+      expect(callHook(hook, "read", { path: "credentials.json" }))
         .rejects.toThrow(/Access denied.*credentials\.json/)
     })
 
     test("blocks .env files", async () => {
-      expect(callHook(hook, "read", { filePath: ".env" }))
+      expect(callHook(hook, "read", { path: ".env" }))
         .rejects.toThrow(/Access denied.*\.env/)
-      expect(callHook(hook, "read", { filePath: ".env.local" }))
+      expect(callHook(hook, "read", { path: ".env.local" }))
         .rejects.toThrow(/Access denied.*\.env\.local/)
-      expect(callHook(hook, "read", { filePath: "production.env" }))
+      expect(callHook(hook, "read", { path: "production.env" }))
         .rejects.toThrow(/Access denied.*production\.env/)
     })
 
     test("blocks certificate files", async () => {
-      expect(callHook(hook, "read", { filePath: "server.crt" }))
+      expect(callHook(hook, "read", { path: "server.crt" }))
         .rejects.toThrow(/Access denied.*server\.crt/)
-      expect(callHook(hook, "read", { filePath: "ca.pem" }))
+      expect(callHook(hook, "read", { path: "ca.pem" }))
         .rejects.toThrow(/Access denied.*ca\.pem/)
-      expect(callHook(hook, "read", { filePath: "private.key" }))
+      expect(callHook(hook, "read", { path: "private.key" }))
         .rejects.toThrow(/Access denied.*private\.key/)
     })
 
     test("blocks id_rsa", async () => {
-      expect(callHook(hook, "read", { filePath: "id_rsa" }))
+      expect(callHook(hook, "read", { path: "id_rsa" }))
         .rejects.toThrow(/Access denied.*id_rsa/)
     })
   })
 
   describe("write tool", () => {
     test("allows writing to allowed files", async () => {
-      expect(callHook(hook, "write", { filePath: "output.txt" })).resolves.toBeUndefined()
+      expect(callHook(hook, "write", { path: "output.txt" })).resolves.toBeUndefined()
     })
 
     test("blocks writing to secrets.json", async () => {
-      expect(callHook(hook, "write", { filePath: "secrets.json" }))
+      expect(callHook(hook, "write", { path: "secrets.json" }))
         .rejects.toThrow(/Access denied.*secrets\.json/)
     })
   })
 
   describe("edit tool", () => {
     test("allows editing allowed files", async () => {
-      expect(callHook(hook, "edit", { filePath: "index.ts" })).resolves.toBeUndefined()
+      expect(callHook(hook, "edit", { path: "index.ts" })).resolves.toBeUndefined()
     })
 
     test("blocks editing secrets.json", async () => {
-      expect(callHook(hook, "edit", { filePath: "secrets.json" }))
+      expect(callHook(hook, "edit", { path: "secrets.json" }))
         .rejects.toThrow(/Access denied.*secrets\.json/)
     })
   })
 })
 
-describe("Search/List Tools Protection", () => {
-  let plugin: any
-  let hook: any
+describe("Search and directory read protection", () => {
+  let hook: Hooks["before"]
 
   beforeAll(async () => {
-    plugin = await createPlugin()
-    hook = plugin["tool.execute.before"]
+    hook = (await createPlugin()).before
   })
 
   describe("glob tool", () => {
@@ -197,152 +236,148 @@ describe("Search/List Tools Protection", () => {
     })
   })
 
-  describe("list tool", () => {
-    test("allows list on project root", async () => {
-      expect(callHook(hook, "list", { path: "." })).resolves.toBeUndefined()
+  describe("directory read", () => {
+    test("allows a directory read of the project root", async () => {
+      expect(callHook(hook, "read", { path: "." })).resolves.toBeUndefined()
     })
 
-    test("allows list on allowed directories", async () => {
-      expect(callHook(hook, "list", { path: "src" })).resolves.toBeUndefined()
+    test("allows a directory read of an allowed directory", async () => {
+      expect(callHook(hook, "read", { path: "src" })).resolves.toBeUndefined()
     })
 
-    test("blocks list on /to/ignore", async () => {
-      expect(callHook(hook, "list", { path: "to/ignore" }))
+    test("blocks a directory read of /to/ignore", async () => {
+      expect(callHook(hook, "read", { path: "to/ignore" }))
         .rejects.toThrow(/Access denied.*to\/ignore/)
     })
 
     test("defaults to . when path not provided", async () => {
-      expect(callHook(hook, "list", {})).resolves.toBeUndefined()
+      expect(callHook(hook, "read", {})).resolves.toBeUndefined()
     })
   })
 })
 
 describe("Pattern Types", () => {
-  let plugin: any
-  let hook: any
+  let hook: Hooks["before"]
 
   beforeAll(async () => {
-    plugin = await createPlugin()
-    hook = plugin["tool.execute.before"]
+    hook = (await createPlugin()).before
   })
 
   describe("absolute patterns", () => {
     test("blocks /to/ignore files", async () => {
-      expect(callHook(hook, "read", { filePath: "to/ignore/file.txt" }))
+      expect(callHook(hook, "read", { path: "to/ignore/file.txt" }))
         .rejects.toThrow(/Access denied/)
     })
 
     test("blocks /somedir/toignore/** files", async () => {
-      expect(callHook(hook, "read", { filePath: "somedir/toignore/nested/file.txt" }))
+      expect(callHook(hook, "read", { path: "somedir/toignore/nested/file.txt" }))
         .rejects.toThrow(/Access denied/)
     })
   })
 
   describe("glob patterns", () => {
     test("blocks **/bamboo-specs/** files", async () => {
-      expect(callHook(hook, "read", { filePath: "foo/bamboo-specs/plan.yml" }))
+      expect(callHook(hook, "read", { path: "foo/bamboo-specs/plan.yml" }))
         .rejects.toThrow(/Access denied/)
-      expect(callHook(hook, "read", { filePath: "bar/baz/bamboo-specs/config.xml" }))
+      expect(callHook(hook, "read", { path: "bar/baz/bamboo-specs/config.xml" }))
         .rejects.toThrow(/Access denied/)
     })
 
     test("allows bamboo-specs directory itself (only blocks files inside)", async () => {
       // Note: Pattern **/bamboo-specs/** blocks files inside, not the dir itself
-      expect(callHook(hook, "list", { path: "bamboo-specs" })).resolves.toBeUndefined()
+      expect(callHook(hook, "read", { path: "bamboo-specs" })).resolves.toBeUndefined()
     })
 
     test("blocks **/keycloak-realm-config/templates/** files", async () => {
-      expect(callHook(hook, "read", { filePath: "keycloak-realm-config/templates/realm.json" }))
+      expect(callHook(hook, "read", { path: "keycloak-realm-config/templates/realm.json" }))
         .rejects.toThrow(/Access denied/)
     })
   })
 
   describe("wildcard patterns", () => {
     test("blocks *-realm.json files", async () => {
-      expect(callHook(hook, "read", { filePath: "dev-realm.json" }))
+      expect(callHook(hook, "read", { path: "dev-realm.json" }))
         .rejects.toThrow(/Access denied/)
-      expect(callHook(hook, "read", { filePath: "prod-realm.json" }))
+      expect(callHook(hook, "read", { path: "prod-realm.json" }))
         .rejects.toThrow(/Access denied/)
     })
 
     test("blocks some*.properties files", async () => {
-      expect(callHook(hook, "read", { filePath: "some.properties" }))
+      expect(callHook(hook, "read", { path: "some.properties" }))
         .rejects.toThrow(/Access denied/)
-      expect(callHook(hook, "read", { filePath: "something.properties" }))
+      expect(callHook(hook, "read", { path: "something.properties" }))
         .rejects.toThrow(/Access denied/)
     })
 
     test("allows other .properties files", async () => {
       // application.properties is also matched by app*.properties pattern
       // Use a file that definitely doesn't match: sample.properties in test-data
-      expect(callHook(hook, "read", { filePath: "test-data/sample.properties" })).resolves.toBeUndefined()
+      expect(callHook(hook, "read", { path: "test-data/sample.properties" })).resolves.toBeUndefined()
     })
   })
 
   describe("negation patterns", () => {
     test("allows *.local.json despite blocking patterns", async () => {
-      expect(callHook(hook, "read", { filePath: "config.local.json" })).resolves.toBeUndefined()
-      expect(callHook(hook, "read", { filePath: "settings.local.jsonc" })).resolves.toBeUndefined()
+      expect(callHook(hook, "read", { path: "config.local.json" })).resolves.toBeUndefined()
+      expect(callHook(hook, "read", { path: "settings.local.jsonc" })).resolves.toBeUndefined()
     })
 
     test("allows *.local.md files", async () => {
-      expect(callHook(hook, "read", { filePath: "notes.local.md" })).resolves.toBeUndefined()
+      expect(callHook(hook, "read", { path: "notes.local.md" })).resolves.toBeUndefined()
     })
 
     test("allows /.local/ directory", async () => {
-      expect(callHook(hook, "list", { path: ".local" })).resolves.toBeUndefined()
-      expect(callHook(hook, "read", { filePath: ".local/impl.md" })).resolves.toBeUndefined()
+      expect(callHook(hook, "read", { path: ".local" })).resolves.toBeUndefined()
+      expect(callHook(hook, "read", { path: ".local/impl.md" })).resolves.toBeUndefined()
     })
 
     test("blocks /somedir/toignore/** but allows file-to-not-ignore.md", async () => {
-      expect(callHook(hook, "read", { filePath: "somedir/toignore/file-to-not-ignore.md" }))
+      expect(callHook(hook, "read", { path: "somedir/toignore/file-to-not-ignore.md" }))
         .resolves.toBeUndefined()
-      expect(callHook(hook, "read", { filePath: "somedir/toignore/other-file.txt" }))
+      expect(callHook(hook, "read", { path: "somedir/toignore/other-file.txt" }))
         .rejects.toThrow(/Access denied/)
     })
 
     test("allows **/target/** due to negation", async () => {
-      expect(callHook(hook, "read", { filePath: "target/output.jar" })).resolves.toBeUndefined()
-      expect(callHook(hook, "list", { path: "target" })).resolves.toBeUndefined()
+      expect(callHook(hook, "read", { path: "target/output.jar" })).resolves.toBeUndefined()
+      expect(callHook(hook, "read", { path: "target" })).resolves.toBeUndefined()
     })
   })
 })
 
 describe("Path Normalization", () => {
-  let plugin: any
-  let hook: any
+  let hook: Hooks["before"]
 
   beforeAll(async () => {
-    plugin = await createPlugin()
-    hook = plugin["tool.execute.before"]
+    hook = (await createPlugin()).before
   })
 
   describe("absolute paths", () => {
     test("handles absolute paths correctly", async () => {
       const absolutePath = path.join(TEST_PROJECT_ROOT, "secrets.json")
-      expect(callHook(hook, "read", { filePath: absolutePath }))
+      expect(callHook(hook, "read", { path: absolutePath }))
         .rejects.toThrow(/Access denied/)
     })
 
     test("allows absolute path to allowed file", async () => {
       const absolutePath = path.join(TEST_PROJECT_ROOT, "README.md")
-      expect(callHook(hook, "read", { filePath: absolutePath })).resolves.toBeUndefined()
+      expect(callHook(hook, "read", { path: absolutePath })).resolves.toBeUndefined()
     })
   })
 
   describe("./ prefix handling", () => {
     test("handles ./ prefix correctly", async () => {
-      expect(callHook(hook, "read", { filePath: "./secrets.json" }))
+      expect(callHook(hook, "read", { path: "./secrets.json" }))
         .rejects.toThrow(/Access denied/)
-      expect(callHook(hook, "read", { filePath: "./index.ts" })).resolves.toBeUndefined()
+      expect(callHook(hook, "read", { path: "./index.ts" })).resolves.toBeUndefined()
     })
   })
 
   describe("nested directories", () => {
     test("handles deeply nested paths", async () => {
-      expect(callHook(hook, "read", { filePath: "foo/bar/baz/bamboo-specs/plan.yml" }))
+      expect(callHook(hook, "read", { path: "foo/bar/baz/bamboo-specs/plan.yml" }))
         .rejects.toThrow(/Access denied/)
-      expect(callHook(hook, "read", { filePath: "deep/nested/path/allowed.txt" }))
+      expect(callHook(hook, "read", { path: "deep/nested/path/allowed.txt" }))
         .resolves.toBeUndefined()
     })
   })
@@ -350,27 +385,25 @@ describe("Path Normalization", () => {
   describe("directory vs file matching", () => {
     test("directories get trailing slash for matching", async () => {
       // bamboo-specs/ as directory should be allowed (only files inside blocked)
-      expect(callHook(hook, "list", { path: "bamboo-specs" })).resolves.toBeUndefined()
+      expect(callHook(hook, "read", { path: "bamboo-specs" })).resolves.toBeUndefined()
       
       // Files inside bamboo-specs/ should be blocked
-      expect(callHook(hook, "read", { filePath: "bamboo-specs/file.txt" }))
+      expect(callHook(hook, "read", { path: "bamboo-specs/file.txt" }))
         .rejects.toThrow(/Access denied/)
     })
 
     test(".local/ directory is allowed", async () => {
-      expect(callHook(hook, "list", { path: ".local" })).resolves.toBeUndefined()
+      expect(callHook(hook, "read", { path: ".local" })).resolves.toBeUndefined()
       expect(callHook(hook, "grep", { path: ".local" })).resolves.toBeUndefined()
     })
   })
 })
 
 describe("Edge Cases", () => {
-  let plugin: any
-  let hook: any
+  let hook: Hooks["before"]
 
   beforeAll(async () => {
-    plugin = await createPlugin()
-    hook = plugin["tool.execute.before"]
+    hook = (await createPlugin()).before
   })
 
   test("handles undefined path gracefully", async () => {
@@ -379,14 +412,14 @@ describe("Edge Cases", () => {
     expect(callHook(hook, "grep", {})).resolves.toBeUndefined()
   })
 
-  test("handles null/missing filePath for file tools", async () => {
+  test("handles a missing path for file tools", async () => {
     // Should not throw, just skip (no path to check)
     expect(callHook(hook, "read", {})).resolves.toBeUndefined()
   })
 
   test("handles empty string path", async () => {
     // Empty string should be treated as current dir
-    expect(callHook(hook, "list", { path: "" })).resolves.toBeUndefined()
+    expect(callHook(hook, "read", { path: "" })).resolves.toBeUndefined()
   })
 
   test("ignores unsupported tools", async () => {
@@ -397,32 +430,31 @@ describe("Edge Cases", () => {
 
   test("error message includes blocked path", async () => {
     try {
-      await callHook(hook, "read", { filePath: "secrets.json" })
+      await callHook(hook, "read", { path: "secrets.json" })
       expect(false).toBe(true) // Should not reach here
-    } catch (e: any) {
-      expect(e.message).toContain("secrets.json")
-      expect(e.message).toContain("blocked by ignore file")
-      expect(e.message).toContain("Access denied")
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : ""
+      expect(message).toContain("secrets.json")
+      expect(message).toContain("blocked by ignore file")
+      expect(message).toContain("Access denied")
     }
   })
 })
 
 describe("Real-world Scenarios", () => {
-  let plugin: any
-  let hook: any
+  let hook: Hooks["before"]
 
   beforeAll(async () => {
-    plugin = await createPlugin()
-    hook = plugin["tool.execute.before"]
+    hook = (await createPlugin()).before
   })
 
   test("allows normal development workflow", async () => {
     // Reading source files
-    expect(callHook(hook, "read", { filePath: "index.ts" })).resolves.toBeUndefined()
-    expect(callHook(hook, "read", { filePath: "README.md" })).resolves.toBeUndefined()
+    expect(callHook(hook, "read", { path: "index.ts" })).resolves.toBeUndefined()
+    expect(callHook(hook, "read", { path: "README.md" })).resolves.toBeUndefined()
     
     // Writing output
-    expect(callHook(hook, "write", { filePath: "output.txt" })).resolves.toBeUndefined()
+    expect(callHook(hook, "write", { path: "output.txt" })).resolves.toBeUndefined()
     
     // Searching codebase
     expect(callHook(hook, "grep", { path: "src" })).resolves.toBeUndefined()
@@ -441,200 +473,195 @@ describe("Real-world Scenarios", () => {
     ]
 
     for (const file of sensitiveFiles) {
-      expect(callHook(hook, "read", { filePath: file }))
+      expect(callHook(hook, "read", { path: file }))
         .rejects.toThrow(/Access denied/)
     }
   })
 
   test("handles complex project structure", async () => {
     // Should allow src directory
-    expect(callHook(hook, "list", { path: "src" })).resolves.toBeUndefined()
+    expect(callHook(hook, "read", { path: "src" })).resolves.toBeUndefined()
     
     // But block bamboo-specs inside any directory
-    expect(callHook(hook, "read", { filePath: "src/bamboo-specs/plan.yml" }))
+    expect(callHook(hook, "read", { path: "src/bamboo-specs/plan.yml" }))
       .rejects.toThrow(/Access denied/)
   })
 })
 
-describe("Glob Tool Result Filtering", () => {
-  let plugin: any
-  let afterHook: any
+describe("Patch Tool Protection", () => {
+  let hook: Hooks["before"]
 
   beforeAll(async () => {
-    plugin = await createPlugin()
-    afterHook = plugin["tool.execute.after"]
+    hook = (await createPlugin()).before
   })
 
-  test("filters blocked files from glob results", async () => {
-    const mockOutput = {
-      files: [
-        "index.ts",              // ALLOWED
-        "secrets.json",          // BLOCKED
-        "credentials.json",      // BLOCKED
-        "README.md",             // ALLOWED
-        ".env",                  // BLOCKED
-        "config.local.json"      // ALLOWED (negation)
-      ]
+  test("blocks add, update, move, and delete paths", async () => {
+    const patchText = `*** Begin Patch
+*** Add File: secrets.json
++secret
+*** Update File: src/app.ts
+*** Move to: credentials.json
+*** Delete File: private.key
+*** End Patch`
+    expect(callHook(hook, "patch", { patchText })).rejects.toThrow(/Access denied.*secrets\.json/)
+  })
+
+  test("blocks a move onto an ignored path when the source is allowed", async () => {
+    const patchText = `*** Begin Patch
+*** Update File: README.md
+*** Move to: .env
+*** End Patch`
+    expect(callHook(hook, "patch", { patchText })).rejects.toThrow(/Access denied.*\.env/)
+  })
+
+  test("allows a patch that only touches ignored-exception files", async () => {
+    const patchText = `*** Begin Patch
+*** Update File: config.local.json
+*** Delete File: notes.local.md
+*** End Patch`
+    expect(callHook(hook, "patch", { patchText })).resolves.toBeUndefined()
+  })
+
+  test("blocks grep of an ignored file path", async () => {
+    expect(callHook(hook, "grep", { pattern: "password", path: "secrets.json" }))
+      .rejects.toThrow(/Access denied.*secrets\.json/)
+  })
+})
+
+describe("Glob Tool Result Filtering", () => {
+  let afterHook: Hooks["after"]
+
+  beforeAll(async () => {
+    afterHook = (await createPlugin()).after
+  })
+
+  function globResult(paths: string[], content: string): ToolResult {
+    return {
+      output: paths.map((entry) => ({ path: entry, type: "file" })),
+      content: [{ type: "text", text: content }],
+      metadata: { count: paths.length, truncated: false },
     }
+  }
 
-    const filtered = await afterHook(
-      { tool: "glob", sessionID: "test", callID: "test" },
-      { args: { pattern: "**/*" }, output: mockOutput }
-    )
+  test("filters blocked files from glob results", async () => {
+    const filtered = await callAfter(afterHook, "glob", { pattern: "**/*" }, globResult(
+      ["index.ts", "secrets.json", "credentials.json", "README.md", ".env", "config.local.json"],
+      ["index.ts", "secrets.json", "credentials.json", "README.md", ".env", "config.local.json"].join("\n"),
+    ))
 
-    expect(filtered.files).toHaveLength(3)
-    expect(filtered.files).toContain("index.ts")
-    expect(filtered.files).toContain("README.md")
-    expect(filtered.files).toContain("config.local.json")
-    expect(filtered.files).not.toContain("secrets.json")
-    expect(filtered.files).not.toContain("credentials.json")
-    expect(filtered.files).not.toContain(".env")
+    const output = filtered.output as { path: string }[]
+    expect(output.map((entry) => entry.path)).toEqual(["index.ts", "README.md", "config.local.json"])
+    expect(textOf(filtered.content)).not.toContain("secrets.json")
+    expect(textOf(filtered.content)).not.toContain(".env")
+    expect(textOf(filtered.content)).toContain("index.ts")
+    expect(filtered.metadata?.count).toBe(3)
   })
 
   test("filters certificate and key files", async () => {
-    const mockOutput = {
-      files: [
-        "server.crt",
-        "private.key",
-        "ca.pem",
-        "README.md"
-      ]
-    }
+    const filtered = await callAfter(afterHook, "glob", { pattern: "**/*" }, globResult(
+      ["server.crt", "private.key", "ca.pem", "README.md"],
+      "server.crt\nprivate.key\nca.pem\nREADME.md",
+    ))
 
-    const filtered = await afterHook(
-      { tool: "glob", sessionID: "test", callID: "test" },
-      { args: { pattern: "**/*" }, output: mockOutput }
-    )
-
-    expect(filtered.files).toHaveLength(1)
-    expect(filtered.files).toContain("README.md")
+    expect((filtered.output as { path: string }[]).map((entry) => entry.path)).toEqual(["README.md"])
   })
 
   test("returns empty array when all files blocked", async () => {
-    const mockOutput = {
-      files: [
-        "secrets.json",
-        "credentials.json",
-        ".env",
-        "private.key"
-      ]
-    }
+    const filtered = await callAfter(afterHook, "glob", { pattern: "**/*" }, globResult(
+      ["secrets.json", "credentials.json", ".env", "private.key"],
+      "secrets.json\ncredentials.json\n.env\nprivate.key",
+    ))
 
-    const filtered = await afterHook(
-      { tool: "glob", sessionID: "test", callID: "test" },
-      { args: { pattern: "**/*" }, output: mockOutput }
-    )
-
-    expect(filtered.files).toHaveLength(0)
-    expect(filtered.files).toEqual([])
+    expect(filtered.output).toEqual([])
+    expect(textOf(filtered.content)).toBe("No files found")
+    expect(textOf(filtered.content)).not.toContain("secrets.json")
   })
 
   test("handles glob results with no files", async () => {
-    const mockOutput = { files: [] }
-
-    const filtered = await afterHook(
-      { tool: "glob", sessionID: "test", callID: "test" },
-      { args: { pattern: "**/*.xyz" }, output: mockOutput }
-    )
-
-    expect(filtered.files).toEqual([])
+    const filtered = await callAfter(afterHook, "glob", { pattern: "**/*.xyz" }, globResult([], "No files found"))
+    expect(filtered.output).toEqual([])
   })
 
   test("handles malformed glob results gracefully", async () => {
-    const mockOutput = { files: null }
-
-    const filtered = await afterHook(
-      { tool: "glob", sessionID: "test", callID: "test" },
-      { args: { pattern: "**/*" }, output: mockOutput }
-    )
-
-    expect(filtered).toEqual(mockOutput)
+    const result = { output: { files: null } }
+    const filtered = await callAfter(afterHook, "glob", { pattern: "**/*" }, result)
+    expect(filtered).toEqual(result)
   })
 
   test("respects negation patterns", async () => {
-    const mockOutput = {
-      files: [
-        "config.local.json",      // ALLOWED (negation)
-        "settings.local.jsonc",   // ALLOWED (negation)
-        ".local/impl.md",         // ALLOWED (negation)
-        "secrets.json"            // BLOCKED
-      ]
-    }
+    const filtered = await callAfter(afterHook, "glob", { pattern: "**/*" }, globResult(
+      ["config.local.json", "settings.local.jsonc", ".local/impl.md", "secrets.json"],
+      "config.local.json\nsettings.local.jsonc\n.local/impl.md\nsecrets.json",
+    ))
 
-    const filtered = await afterHook(
-      { tool: "glob", sessionID: "test", callID: "test" },
-      { args: { pattern: "**/*" }, output: mockOutput }
-    )
-
-    expect(filtered.files).toHaveLength(3)
-    expect(filtered.files).toContain("config.local.json")
-    expect(filtered.files).toContain("settings.local.jsonc")
-    expect(filtered.files).toContain(".local/impl.md")
+    expect((filtered.output as { path: string }[]).map((entry) => entry.path)).toEqual([
+      "config.local.json",
+      "settings.local.jsonc",
+      ".local/impl.md",
+    ])
   })
 
   test("does not filter non-glob tools", async () => {
-    const mockOutput = {
-      files: ["secrets.json", "index.ts"]
-    }
+    const result = { output: [{ path: "secrets.json", type: "file" }, { path: "index.ts", type: "file" }] }
+    const filtered = await callAfter(afterHook, "write", {}, result)
+    expect(filtered).toEqual(result)
+  })
 
-    const filtered = await afterHook(
-      { tool: "read", sessionID: "test", callID: "test" },
-      { args: {}, output: mockOutput }
-    )
+  test("rebuilds string content so a leaked path disappears", async () => {
+    const filtered = await callAfter(afterHook, "glob", { pattern: "**/*" }, {
+      output: [{ path: "secrets.json", type: "file" }, { path: "README.md", type: "file" }],
+      content: "C:\\secret\\secrets.json\nC:\\project\\README.md",
+      metadata: { count: 2, truncated: false },
+    })
 
-    // Should return unchanged for non-glob tools
-    expect(filtered).toEqual(mockOutput)
+    expect(typeof filtered.content).toBe("string")
+    expect(textOf(filtered.content)).not.toContain("secrets.json")
+    expect(textOf(filtered.content)).toContain("README.md")
   })
 })
 
 describe("Grep Tool Result Filtering", () => {
-  let plugin: any
-  let afterHook: any
+  let afterHook: Hooks["after"]
 
   beforeAll(async () => {
-    plugin = await createPlugin()
-    afterHook = plugin["tool.execute.after"]
+    afterHook = (await createPlugin()).after
   })
 
+  function match(file: string, line: number, text: string) {
+    return { entry: { path: file, type: "file" }, line, offset: 0, text, submatches: [] }
+  }
+
   test("filters blocked files from grep results", async () => {
-    const mockOutput = {
-      matches: [
-        { file: "index.ts", line: 10, column: 5, match: "export" },           // ALLOWED
-        { file: "secrets.json", line: 3, column: 10, match: "password" },     // BLOCKED
-        { file: "README.md", line: 1, column: 0, match: "# opencode" },       // ALLOWED
-        { file: ".env", line: 5, column: 0, match: "API_KEY=secret" }         // BLOCKED
-      ]
-    }
+    const filtered = await callAfter(afterHook, "grep", { pattern: ".*" }, {
+      output: [
+        match("index.ts", 10, "export"),
+        match("secrets.json", 3, "password"),
+        match("README.md", 1, "# opencode"),
+        match(".env", 5, "API_KEY=secret"),
+      ],
+      content: [{ type: "text", text: "secrets.json:\n  Line 3: password\n.env:\n  Line 5: API_KEY=secret" }],
+      metadata: { matches: 4, truncated: false },
+    })
 
-    const filtered = await afterHook(
-      { tool: "grep", sessionID: "test", callID: "test" },
-      { args: { pattern: ".*" }, output: mockOutput }
-    )
-
-    expect(filtered.matches).toHaveLength(2)
-    expect(filtered.matches[0].file).toBe("index.ts")
-    expect(filtered.matches[1].file).toBe("README.md")
+    const output = filtered.output as { entry: { path: string } }[]
+    expect(output.map((item) => item.entry.path)).toEqual(["index.ts", "README.md"])
+    expect(textOf(filtered.content)).not.toContain("password")
+    expect(textOf(filtered.content)).not.toContain("API_KEY")
+    expect(textOf(filtered.content)).toContain("export")
+    expect(filtered.metadata?.matches).toBe(2)
   })
 
   test("does not leak any info about blocked files", async () => {
-    const mockOutput = {
-      matches: [
-        { file: "credentials.json", line: 7, column: 15, match: "admin_password: secret123" },
-        { file: "private.key", line: 1, column: 0, match: "-----BEGIN PRIVATE KEY-----" },
-        { file: "index.ts", line: 50, column: 10, match: "const config" }
-      ]
-    }
+    const filtered = await callAfter(afterHook, "grep", { pattern: ".*" }, {
+      output: [
+        match("credentials.json", 7, "admin_password: secret123"),
+        match("private.key", 1, "-----BEGIN PRIVATE KEY-----"),
+        match("index.ts", 50, "const config"),
+      ],
+      content: "credentials.json:\n  Line 7: admin_password: secret123\nprivate.key:\n  Line 1: -----BEGIN PRIVATE KEY-----",
+    })
 
-    const filtered = await afterHook(
-      { tool: "grep", sessionID: "test", callID: "test" },
-      { args: { pattern: ".*" }, output: mockOutput }
-    )
-
-    // Only allowed file should remain
-    expect(filtered.matches).toHaveLength(1)
-    expect(filtered.matches[0].file).toBe("index.ts")
-    
-    // Ensure no info from blocked files leaks
+    expect((filtered.output as { entry: { path: string } }[]).map((item) => item.entry.path)).toEqual(["index.ts"])
     const resultStr = JSON.stringify(filtered)
     expect(resultStr).not.toContain("credentials.json")
     expect(resultStr).not.toContain("private.key")
@@ -643,94 +670,134 @@ describe("Grep Tool Result Filtering", () => {
   })
 
   test("returns empty matches when all blocked", async () => {
-    const mockOutput = {
-      matches: [
-        { file: "secrets.json", line: 1, match: "secret" },
-        { file: ".env", line: 2, match: "password" },
-        { file: "private.key", line: 5, match: "key data" }
-      ]
-    }
+    const filtered = await callAfter(afterHook, "grep", { pattern: "secret" }, {
+      output: [
+        match("secrets.json", 1, "secret"),
+        match(".env", 2, "password"),
+        match("private.key", 5, "key data"),
+      ],
+      content: [{ type: "text", text: "Line 1: secret" }],
+    })
 
-    const filtered = await afterHook(
-      { tool: "grep", sessionID: "test", callID: "test" },
-      { args: { pattern: "secret" }, output: mockOutput }
-    )
-
-    expect(filtered.matches).toHaveLength(0)
-    expect(filtered.matches).toEqual([])
+    expect(filtered.output).toEqual([])
+    expect(textOf(filtered.content)).toBe("No matches found")
+    expect(textOf(filtered.content)).not.toContain("secret")
   })
 
   test("handles grep results with no matches", async () => {
-    const mockOutput = { matches: [] }
-
-    const filtered = await afterHook(
-      { tool: "grep", sessionID: "test", callID: "test" },
-      { args: { pattern: "nonexistent" }, output: mockOutput }
-    )
-
-    expect(filtered.matches).toEqual([])
+    const filtered = await callAfter(afterHook, "grep", { pattern: "nonexistent" }, {
+      output: [],
+      content: "No matches found",
+    })
+    expect(filtered.output).toEqual([])
   })
 
   test("handles malformed grep results gracefully", async () => {
-    const mockOutput = { matches: null }
-
-    const filtered = await afterHook(
-      { tool: "grep", sessionID: "test", callID: "test" },
-      { args: { pattern: "test" }, output: mockOutput }
-    )
-
-    expect(filtered).toEqual(mockOutput)
+    const result = { output: { matches: null } }
+    const filtered = await callAfter(afterHook, "grep", { pattern: "test" }, result)
+    expect(filtered).toEqual(result)
   })
 
   test("keeps matches without file info", async () => {
-    const mockOutput = {
-      matches: [
-        { file: "index.ts", line: 10, match: "export" },
-        { line: 5, match: "some match without file" },  // No file property
-        { file: "secrets.json", line: 3, match: "password" }
-      ]
-    }
+    const pathless = { line: 5, text: "some match without file" }
+    const filtered = await callAfter(afterHook, "grep", { pattern: ".*" }, {
+      output: [
+        match("index.ts", 10, "export"),
+        pathless,
+        match("secrets.json", 3, "password"),
+      ],
+      content: "password",
+    })
 
-    const filtered = await afterHook(
-      { tool: "grep", sessionID: "test", callID: "test" },
-      { args: { pattern: ".*" }, output: mockOutput }
-    )
-
-    expect(filtered.matches).toHaveLength(2)
-    expect(filtered.matches[0].file).toBe("index.ts")
-    expect(filtered.matches[1]).not.toHaveProperty("file")
+    const output = filtered.output as unknown[]
+    expect(output).toHaveLength(2)
+    expect(output[0]).toMatchObject({ entry: { path: "index.ts" } })
+    expect(output[1]).toEqual(pathless)
+    expect(textOf(filtered.content)).not.toContain("password")
   })
 
   test("respects negation patterns in grep", async () => {
-    const mockOutput = {
-      matches: [
-        { file: "config.local.json", line: 1, match: "config" },    // ALLOWED (negation)
-        { file: ".local/notes.md", line: 5, match: "notes" },       // ALLOWED (negation)
-        { file: "secrets.json", line: 2, match: "secret" }          // BLOCKED
-      ]
-    }
+    const filtered = await callAfter(afterHook, "grep", { pattern: ".*" }, {
+      output: [
+        match("config.local.json", 1, "config"),
+        match(".local/notes.md", 5, "notes"),
+        match("secrets.json", 2, "secret"),
+      ],
+      content: "secret",
+    })
 
-    const filtered = await afterHook(
-      { tool: "grep", sessionID: "test", callID: "test" },
-      { args: { pattern: ".*" }, output: mockOutput }
-    )
-
-    expect(filtered.matches).toHaveLength(2)
-    expect(filtered.matches[0].file).toBe("config.local.json")
-    expect(filtered.matches[1].file).toBe(".local/notes.md")
+    expect((filtered.output as { entry: { path: string } }[]).map((item) => item.entry.path)).toEqual([
+      "config.local.json",
+      ".local/notes.md",
+    ])
   })
 
   test("does not filter non-grep tools", async () => {
-    const mockOutput = {
-      matches: [{ file: "secrets.json", line: 1, match: "secret" }]
+    const result = { output: [match("secrets.json", 1, "secret")] }
+    const filtered = await callAfter(afterHook, "write", {}, result)
+    expect(filtered).toEqual(result)
+  })
+})
+
+describe("Read Directory Result Filtering", () => {
+  let afterHook: Hooks["after"]
+
+  beforeAll(async () => {
+    afterHook = (await createPlugin()).after
+  })
+
+  test("removes ignored names from a directory listing and its preview", async () => {
+    const filtered = await callAfter(afterHook, "read", { path: "src", offset: 1 }, {
+      output: {
+        type: "list-page",
+        entries: [
+          { path: "index.ts", type: "file" },
+          { path: "secrets.json", type: "file" },
+          { path: "private.key", type: "file" },
+          { path: "notes.local.md", type: "file" },
+        ],
+        truncated: false,
+      },
+      content: [{
+        type: "text",
+        text: "Read directory src, entries 1-4\nsrc/index.ts\nsrc/secrets.json\npassword=secret123",
+      }],
+      metadata: { truncated: false },
+    })
+
+    const output = filtered.output as { entries: { path: string }[] }
+    expect(output.entries.map((entry) => entry.path)).toEqual(["index.ts", "notes.local.md"])
+    expect(textOf(filtered.content)).toBe("Read directory src, entries 1-2\nindex.ts\nnotes.local.md")
+    expect(textOf(filtered.content)).not.toContain("secrets.json")
+    expect(textOf(filtered.content)).not.toContain("private.key")
+    expect(textOf(filtered.content)).not.toContain("secret123")
+  })
+
+  test("removes an ignored directory from a parent listing", async () => {
+    const filtered = await callAfter(afterHook, "read", { path: "to" }, {
+      output: {
+        type: "list-page",
+        entries: [
+          { path: "keep.txt", type: "file" },
+          { path: "ignore\\", type: "directory" },
+        ],
+        truncated: false,
+      },
+      content: "keep.txt\nignore\nsecret inside",
+    })
+
+    const output = filtered.output as { entries: { path: string }[] }
+    expect(output.entries.map((entry) => entry.path)).toEqual(["keep.txt"])
+    expect(textOf(filtered.content)).toBe("Read directory to, entries 1-1\nkeep.txt")
+    expect(textOf(filtered.content)).not.toContain("secret inside")
+  })
+
+  test("leaves file reads unchanged", async () => {
+    const result = {
+      output: { type: "file", content: "hello", encoding: "utf8", mime: "text/plain" },
+      content: "Read file README.md, lines 1-1\n1: hello",
     }
-
-    const filtered = await afterHook(
-      { tool: "write", sessionID: "test", callID: "test" },
-      { args: {}, output: mockOutput }
-    )
-
-    // Should return unchanged for non-grep tools
-    expect(filtered).toEqual(mockOutput)
+    const filtered = await callAfter(afterHook, "read", { path: "README.md" }, result)
+    expect(filtered).toEqual(result)
   })
 })

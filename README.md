@@ -1,6 +1,6 @@
 # opencode-ignore
 
-OpenCode v1 plugin to restrict AI access to files and directories using `.ignore` patterns (gitignore-style).
+OpenCode v2 plugin to restrict AI access to files and directories using `.ignore` patterns (gitignore-style).
 
 > **Disclaimer:** `opencode-ignore` is an independent project. It is not built by the OpenCode team and is not affiliated with OpenCode.
 
@@ -11,7 +11,7 @@ Add to your OpenCode configuration (`~/.config/opencode/opencode.json`):
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": [
+  "plugins": [
     "opencode-ignore"
   ]
 }
@@ -131,26 +131,25 @@ api-keys.json
 
 ## Supported Tools
 
-The plugin protects the following OpenCode native tools:
+The plugin protects the following OpenCode v2 native tools. Paths are the `path` argument (`patch` uses paths inside `patchText`).
 
-### File Operations (Pre-execution blocking)
-- `read` - Blocks reading blocked files
-- `write` - Blocks writing to blocked paths
-- `edit` - Blocks editing blocked files
+### File operations (blocked before execution)
+- `read` - Blocks reading an ignored file. Reading a directory lists that directory; ignored children are removed from the listing and its preview.
+- `write` - Blocks writing an ignored path
+- `edit` - Blocks editing an ignored file
+- `patch` - Blocks the whole patch when any `*** Add File:`, `*** Update File:`, `*** Move to:`, or `*** Delete File:` path is ignored
 
-### Search Operations (Pre-execution + Post-execution filtering)
-- `glob` - Blocks searching in blocked directories, filters blocked files from results
-- `grep` - Blocks searching in blocked directories, filters matches from blocked files
+### Search (search root blocked before execution, hits removed after)
+- `glob` - Blocks an ignored search directory, then drops ignored files from the result list and the model text
+- `grep` - Blocks an ignored search path, then drops ignored matches. Line previews are rebuilt from the remaining matches, so a removed file's text cannot stay in the model output
 
-### List Operations (Pre-execution blocking)
-- `list` - Blocks listing blocked directories
+Shell commands are not intercepted. A shell command that prints a file can still reveal it.
 
-**Protection Levels**:
-- **Pre-execution**: Prevents tool from accessing blocked paths entirely (read, write, edit, list)
-- **Post-execution**: Allows search but filters blocked files from results (glob, grep)
-- This two-phase approach prevents both direct access and information disclosure
+**Protection levels**:
+- **Before execution**: The tool is denied and the model receives the access-denied message (read, write, edit, patch, and a glob/grep search root)
+- **After execution**: An allowed search or directory listing still has ignored paths and their previews removed (glob, grep, directory `read`)
 
-**Note**: Project root (`.`) is always accessible to prevent blocking entire project.
+**Note**: Project root (`.`) is always accessible.
 
 ## How It Works
 
@@ -160,12 +159,12 @@ The plugin protects the following OpenCode native tools:
 3. Paths are checked against ignore patterns using the `ignore` library
 4. If matched, tool execution is blocked with clear error message
 
-### Post-execution Filtering (glob/grep)
-For `glob` and `grep` tools, additional protection filters results:
-1. Tool executes normally (searching allowed directories)
-2. Results are filtered to remove any files matching `.ignore` patterns
-3. Blocked files are completely removed from output (no partial data leakage)
-4. Empty results returned if all matches are filtered
+### After-execution filtering (glob, grep, directory read)
+When the search root or directory itself is allowed:
+1. The tool runs
+2. Ignored paths are removed from the structured result
+3. The model text is rebuilt from what remains, so a line preview or directory name cannot leak
+4. An empty result is reported when every hit was ignored
 
 ### Graceful Degradation
 - If `.ignore` missing, all access is allowed
@@ -225,4 +224,4 @@ MIT
 ## Related
 
 - [`ignore`](https://github.com/kaelzhang/node-ignore) - The underlying pattern matching library
-- [OpenCode Plugin Documentation](https://opencode.ai/docs/plugins)
+- [OpenCode v2 plugins](https://opencode.ai/v2/docs/build/plugins/)
