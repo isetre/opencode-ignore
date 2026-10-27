@@ -1,4 +1,4 @@
-import { lstatSync, readlinkSync, realpathSync, statSync } from "node:fs"
+import { lstatSync, readlinkSync, realpathSync, statSync, type Stats } from "node:fs"
 import { Plugin } from "@opencode/plugin"
 import type { Tool } from "@opencode/schema/tool"
 import ignore from "ignore"
@@ -60,22 +60,23 @@ type PathKind = "file" | "directory" | "missing" | "invalid"
 interface PathInfo {
   path: string
   kind: PathKind
+  stats?: Stats
 }
 
-function pathKind(targetPath: string, projectRoot: string): PathKind {
-  if (targetPath === "." || targetPath === "") return "directory"
-  const absolutePath = isAbsolute(targetPath) ? targetPath : join(projectRoot, targetPath)
-  const info = (() => {
-    try {
-      return statSync(absolutePath, { throwIfNoEntry: false })
-    } catch {
-      return null
-    }
-  })()
-  if (info === null) return "invalid"
-  if (!info) return "missing"
-  if (info.isDirectory()) return "directory"
-  return "file"
+function statOf(absolute: string): Stats | undefined | null {
+  try {
+    return statSync(absolute, { throwIfNoEntry: false })
+  } catch {
+    return null
+  }
+}
+
+function pathTarget(targetPath: string, projectRoot: string): PathInfo {
+  if (targetPath === "." || targetPath === "") return { path: targetPath, kind: "directory" }
+  const stats = statOf(isAbsolute(targetPath) ? targetPath : join(projectRoot, targetPath))
+  if (stats === null) return { path: targetPath, kind: "invalid" }
+  if (!stats) return { path: targetPath, kind: "missing" }
+  return { path: targetPath, kind: stats.isDirectory() ? "directory" : "file", stats }
 }
 
 function formsFor(kind: PathKind): boolean[] {
@@ -105,15 +106,9 @@ const MAX_LINK_HOPS = 40
  * through its nearest existing parent, and a dangling link through its target,
  * so a new file under a linked folder is checked where it will be written.
  */
-function realPathOf(absolute: string, hops = 0): string | null {
+function realPathOf(absolute: string, hops = 0, known?: Stats): string | null {
   if (hops > MAX_LINK_HOPS) return null
-  const info = (() => {
-    try {
-      return statSync(absolute, { throwIfNoEntry: false })
-    } catch {
-      return null
-    }
-  })()
+  const info = known ?? statOf(absolute)
   if (info === null) return null
   if (info) {
     try {
@@ -154,10 +149,10 @@ function realRootOf(projectRoot: string): string | null {
   return realRoot
 }
 
-function canonicalTarget(targetPath: string, projectRoot: string): string | undefined | null {
-  if (targetPath === "." || targetPath === "") return undefined
-  const absolute = isAbsolute(targetPath) ? targetPath : join(projectRoot, targetPath)
-  const realTarget = realPathOf(absolute)
+function canonicalTarget(target: PathInfo, projectRoot: string): string | undefined | null {
+  if (target.path === "." || target.path === "") return undefined
+  const absolute = isAbsolute(target.path) ? target.path : join(projectRoot, target.path)
+  const realTarget = realPathOf(absolute, 0, target.stats)
   const realRoot = realRootOf(projectRoot)
   if (!realTarget || !realRoot) return null
   const relativePath = relative(realRoot, realTarget).replace(/\\/g, "/")
@@ -171,7 +166,7 @@ function matchesIgnore(ignoreLib: IgnoreLib, target: PathInfo, projectRoot: stri
   if (leavesProject(target.path, target.kind, projectRoot)) return true
   if (ignoredByPattern(ignoreLib, target.path, target.kind, projectRoot)) return true
 
-  const canonical = canonicalTarget(target.path, projectRoot)
+  const canonical = canonicalTarget(target, projectRoot)
   if (canonical === null) return true
   const requested = normalizePath(target.path, projectRoot, false)
   if (!canonical || canonical === "." || canonical === requested) return false
@@ -244,7 +239,7 @@ function targetsFor(tool: string, input: Record<string, unknown>, projectRoot: s
     const targetPath = stringField(input, "path")
     if (targetPath === undefined) return []
     if (targetPath === "") return [{ path: ".", kind: "directory" }]
-    if (tool === "read") return [{ path: targetPath, kind: pathKind(targetPath, projectRoot) }]
+    if (tool === "read") return [pathTarget(targetPath, projectRoot)]
     return [{ path: targetPath, kind: "file" }]
   }
 
@@ -256,7 +251,7 @@ function targetsFor(tool: string, input: Record<string, unknown>, projectRoot: s
   if (tool === "grep") {
     const targetPath = stringField(input, "path") || "."
     const path = targetPath === "" ? "." : targetPath
-    return [{ path, kind: pathKind(path, projectRoot) }]
+    return [pathTarget(path, projectRoot)]
   }
 
   if (tool === "patch") {
@@ -392,7 +387,7 @@ function entryTarget(directory: string, entry: ListEntry, projectRoot: string): 
   const name = entry.path.replace(/[\\/]+$/, "")
   const path = directory === "." || directory === "" ? name : `${directory.replace(/\\/g, "/")}/${name}`
   if (entry.type === "directory" || entry.path.endsWith("/") || entry.path.endsWith("\\")) return { path, kind: "directory" }
-  return { path, kind: pathKind(path, projectRoot) }
+  return pathTarget(path, projectRoot)
 }
 
 function filterGlob(result: Tool.Result, ignoreLib: IgnoreLib, projectRoot: string): Tool.Result {
@@ -446,8 +441,7 @@ function filterRead(result: Tool.Result, input: unknown, ignoreLib: IgnoreLib, p
 }
 
 function pathIsIgnored(targetPath: string, ignoreLib: IgnoreLib, projectRoot: string): boolean {
-  const target = { path: targetPath, kind: pathKind(targetPath, projectRoot) }
-  return matchesIgnore(ignoreLib, target, projectRoot)
+  return matchesIgnore(ignoreLib, pathTarget(targetPath, projectRoot), projectRoot)
 }
 
 function fileReadPath(result: Tool.Result, input: unknown): string | undefined {
