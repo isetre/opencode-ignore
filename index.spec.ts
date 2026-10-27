@@ -24,8 +24,9 @@ interface ToolResult {
 interface AfterEvent {
   tool: string
   input: Record<string, unknown>
-  status: "completed"
-  result: ToolResult
+  status: "completed" | "error"
+  result?: ToolResult
+  error?: Error
 }
 
 interface Hooks {
@@ -49,10 +50,12 @@ async function createPlugin(projectRoot = TEST_PROJECT_ROOT): Promise<Hooks> {
   return { before: hooks.before, after: hooks.after }
 }
 
-async function callAfter(hook: Hooks["after"], tool: string, input: Record<string, unknown>, result: ToolResult) {
-  const event: AfterEvent = { tool, input, status: "completed", result }
+async function callAfter(hook: Hooks["after"], tool: string, input: Record<string, unknown>, result: ToolResult, error?: Error) {
+  const event: AfterEvent = error
+    ? { tool, input, status: "error", error }
+    : { tool, input, status: "completed", result }
   await hook(event)
-  return event.result
+  return error ? event : event.result
 }
 
 function textOf(content: ToolResult["content"]): string {
@@ -436,6 +439,11 @@ describe("Edge Cases", () => {
       .rejects.toThrow(/Access denied.*secrets\.json/)
   })
 
+  test("allows paths that normalize to the project root", async () => {
+    expect(callHook(hook, "read", { path: "src/.." })).resolves.toBeUndefined()
+    expect(callHook(hook, "read", { path: "foo/bar/../.." })).resolves.toBeUndefined()
+  })
+
   test("ignores unsupported tools", async () => {
     // Tool that's not in extractPathFromTool should be skipped
     expect(callHook(hook, "unknown_tool", { somePath: "secrets.json" }))
@@ -534,6 +542,30 @@ describe("Patch Tool Protection", () => {
 *** Delete File: notes.local.md
 *** End Patch`
     expect(callHook(hook, "patch", { patchText })).resolves.toBeUndefined()
+  })
+
+  test("blocks indented patch headers without treating added header text as a path", async () => {
+    await expect(callHook(hook, "patch", {
+      patchText: "*** Begin Patch\n *** Update File: secrets.json\n@@\n-secret\n+nope\n*** End Patch",
+    })).rejects.toThrow(/Access denied.*secrets\.json/)
+
+    await expect(callHook(hook, "patch", {
+      patchText: "*** Begin Patch\n*** Update File: README.md\n@@\n-old\n+ *** Update File: secrets.json\n*** End Patch",
+    })).resolves.toBeUndefined()
+  })
+
+  test("blocks indented headers after add and delete hunks", async () => {
+    for (const header of ["*** Add File: README.md", "*** Delete File: README.md"]) {
+      const patchText = `*** Begin Patch
+${header}
+${header.startsWith("*** Add") ? "+hello" : ""}
+ *** Update File: secrets.json
+@@
+-secret
++stolen
+*** End Patch`
+      await expect(callHook(hook, "patch", { patchText })).rejects.toThrow(/Access denied.*secrets\.json/)
+    }
   })
 
   test("blocks grep of an ignored file path", async () => {
@@ -991,5 +1023,55 @@ describe("Read Directory Result Filtering", () => {
     }
     const filtered = await callAfter(afterHook, "read", { path: "README.md" }, result)
     expect(filtered).toEqual(result)
+  })
+
+  test("removes a sensitive completed file read even when output names it", async () => {
+    const dir = path.join(tmpdir(), "opencode-ignore-read-" + Date.now())
+    await Bun.write(path.join(dir, ".ignore"), "team's-key.json\n")
+    const filtered = await callAfter((await createPlugin(dir)).after, "read", { path: "team’s-key.json" }, {
+      output: { type: "file", name: "team's-key.json", content: "secret", encoding: "utf8", mime: "text/plain" },
+      content: "Read file team’s-key.json, lines 1-1\nsecret",
+    })
+    expect(textOf(filtered?.content)).toContain("Access denied")
+    expect(JSON.stringify(filtered)).not.toContain("secret")
+    expect(JSON.stringify(filtered)).not.toContain("team's-key.json")
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test("removes ignored directory symlink entries from listings", async () => {
+    const dir = path.join(tmpdir(), "opencode-ignore-symlink-list-" + Date.now())
+    const target = path.join(dir, "secret-dir")
+    const alias = path.join(dir, "alias")
+    await Bun.write(path.join(dir, ".ignore"), "secret-dir/\n")
+    await Bun.write(path.join(target, "secret.txt"), "secret")
+    if (process.platform === "win32") symlinkSync(target, alias, "junction")
+    else symlinkSync(target, alias)
+
+    const filtered = await callAfter((await createPlugin(dir)).after, "read", { path: "." }, {
+      output: {
+        type: "list-page",
+        entries: [{ path: "alias", type: "symlink" }],
+        truncated: false,
+      },
+      content: "Read directory ., entries 1-1\nalias",
+    })
+
+    expect((filtered.output as { entries: { path: string }[] }).entries).toEqual([])
+    expect(textOf(filtered.content)).not.toContain("alias")
+    rmSync(dir, { recursive: true, force: true })
+  })
+})
+
+describe("Completed read and error filtering", () => {
+  test("folds curly apostrophes for before matching and error suggestions", async () => {
+    const dir = path.join(tmpdir(), "opencode-ignore-fold-" + Date.now())
+    await Bun.write(path.join(dir, ".ignore"), "team's-key.json\nsecrets.json\n")
+    const hooks = await createPlugin(dir)
+    await expect(callHook(hooks.before, "read", { path: "team’s-key.json" })).rejects.toThrow(/Access denied/)
+    const error = new Error("File not found: secret.json\n\nDid you mean one of these?\nsecrets.json\nREADME.md")
+    const result = await callAfter(hooks.after, "read", { path: "secret.json" }, {}, error)
+    expect(result.error?.message).not.toContain("secrets.json")
+    expect(result.error?.message).toContain("README.md")
+    rmSync(dir, { recursive: true, force: true })
   })
 })

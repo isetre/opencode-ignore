@@ -141,7 +141,7 @@ The plugin protects the following OpenCode v2 native tools. Paths are the `path`
 - `edit` - Blocks editing an ignored file
 - `patch` - Blocks the whole patch when any `*** Add File:`, `*** Update File:`, `*** Move to:`, or `*** Delete File:` path is ignored
 
-The project `.ignore` file is always denied for `read`, `write`, `edit`, `patch`, `glob`, and `grep`, even when no pattern matches it. Glob results, grep matches, and directory listings drop it as well. On Windows, `.Ignore` is the same file. A path is checked as given and, when it is a symlink, at its canonical target. A path that leaves the project is denied.
+The project `.ignore` file is always denied for `read`, `write`, `edit`, `patch`, `glob`, and `grep`, even when no pattern matches it. Glob results, grep matches, and directory listings drop it as well. On Windows and macOS, case variants such as `.Ignore` are the same file. A path is checked as given and, when it is a symlink, at its canonical target. A path that leaves the project is denied.
 
 ### Search (search root blocked before execution, hits removed after)
 - `glob` - Blocks an ignored search directory, then drops ignored files from the result list and the model text

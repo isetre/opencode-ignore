@@ -2,7 +2,7 @@ import { realpathSync, statSync } from "node:fs"
 import { Plugin } from "@opencode/plugin"
 import type { Tool } from "@opencode/schema/tool"
 import ignore from "ignore"
-import { isAbsolute, join, relative, resolve } from "path"
+import { dirname, isAbsolute, join, relative, resolve } from "path"
 
 /**
  * Load ignore patterns from project root.
@@ -13,11 +13,17 @@ async function loadIgnore(projectRoot: string): Promise<ReturnType<typeof ignore
   const file = Bun.file(ignorePath)
   if (await file.exists()) {
     const ignoreLib = ignore()
-    ignoreLib.add(await file.text())
+    ignoreLib.add(foldText(await file.text()))
     return ignoreLib
   }
 
   return null
+}
+
+function foldText(value: string): string {
+  return value.normalize("NFC")
+    .replace(/[\u00A0\u202F]/g, " ")
+    .replace(/[\u2018\u2019]/g, "'")
 }
 
 /**
@@ -25,7 +31,8 @@ async function loadIgnore(projectRoot: string): Promise<ReturnType<typeof ignore
  * Relative to project root, no "./" prefix, forward slashes, trailing "/" for directories.
  */
 function normalizePath(targetPath: string, projectRoot: string, isDirectory: boolean): string | undefined {
-  const absolutePath = isAbsolute(targetPath) ? targetPath : join(projectRoot, targetPath)
+  const foldedPath = foldText(targetPath)
+  const absolutePath = isAbsolute(foldedPath) ? foldedPath : join(projectRoot, foldedPath)
   const relativePath = relative(projectRoot, absolutePath)
   const resolvedPath = relativePath === "" ? "." : relativePath
   const normalizedPath = resolvedPath.replace(/\\/g, "/")
@@ -34,7 +41,7 @@ function normalizePath(targetPath: string, projectRoot: string, isDirectory: boo
     ? withoutPrefixPath + "/"
     : withoutPrefixPath
 
-  if (!ignore.isPathValid(withSlashPath)) return undefined
+  if (withSlashPath !== "." && !ignore.isPathValid(withSlashPath)) return undefined
   return withSlashPath
 }
 
@@ -43,12 +50,12 @@ const POLICY_FILE = ".ignore"
 function isPolicyFile(targetPath: string, projectRoot: string): boolean {
   const normalized = normalizePath(targetPath, projectRoot, false)
   if (!normalized) return false
-  const name = process.platform === "win32" ? normalized.toLowerCase() : normalized
+  const name = process.platform === "win32" || process.platform === "darwin" ? normalized.toLowerCase() : normalized
   return name === POLICY_FILE
 }
 
 type IgnoreLib = ReturnType<typeof ignore>
-type PathKind = "file" | "directory" | "missing"
+type PathKind = "file" | "directory" | "missing" | "invalid"
 
 interface PathInfo {
   path: string
@@ -58,7 +65,14 @@ interface PathInfo {
 function pathKind(targetPath: string, projectRoot: string): PathKind {
   if (targetPath === "." || targetPath === "") return "directory"
   const absolutePath = isAbsolute(targetPath) ? targetPath : join(projectRoot, targetPath)
-  const info = statSync(absolutePath, { throwIfNoEntry: false })
+  const info = (() => {
+    try {
+      return statSync(absolutePath, { throwIfNoEntry: false })
+    } catch {
+      return null
+    }
+  })()
+  if (info === null) return "invalid"
   if (!info) return "missing"
   if (info.isDirectory()) return "directory"
   return "file"
@@ -67,6 +81,7 @@ function pathKind(targetPath: string, projectRoot: string): PathKind {
 function formsFor(kind: PathKind): boolean[] {
   if (kind === "directory") return [true]
   if (kind === "file") return [false]
+  if (kind === "invalid") return [false, true]
   return [false, true]
 }
 
@@ -83,24 +98,46 @@ function ignoredByPattern(ignoreLib: IgnoreLib, targetPath: string, kind: PathKi
   })
 }
 
-function canonicalTarget(targetPath: string, projectRoot: string): string | undefined {
+function canonicalTarget(targetPath: string, projectRoot: string): string | undefined | null {
   if (targetPath === "." || targetPath === "") return undefined
   const absolute = isAbsolute(targetPath) ? targetPath : join(projectRoot, targetPath)
-  const info = statSync(absolute, { throwIfNoEntry: false })
+  const info = (() => {
+    try {
+      return statSync(absolute, { throwIfNoEntry: false })
+    } catch {
+      return null
+    }
+  })()
+  if (info === null) return null
   if (!info) return undefined
-  const realTarget = realpathSync(absolute)
-  const realRoot = realpathSync(projectRoot)
+  const realTarget = (() => {
+    try {
+      return realpathSync(absolute)
+    } catch {
+      return null
+    }
+  })()
+  const realRoot = (() => {
+    try {
+      return realpathSync(projectRoot)
+    } catch {
+      return null
+    }
+  })()
+  if (!realTarget || !realRoot) return null
   const relativePath = relative(realRoot, realTarget).replace(/\\/g, "/")
   return relativePath === "" ? "." : relativePath
 }
 
 function matchesIgnore(ignoreLib: IgnoreLib, target: PathInfo, projectRoot: string): boolean {
   if (target.path === "." || target.path === "") return false
+  if (target.kind === "invalid") return true
   if (isPolicyFile(target.path, projectRoot)) return true
   if (leavesProject(target.path, target.kind, projectRoot)) return true
   if (ignoredByPattern(ignoreLib, target.path, target.kind, projectRoot)) return true
 
   const canonical = canonicalTarget(target.path, projectRoot)
+  if (canonical === null) return true
   const requested = normalizePath(target.path, projectRoot, false)
   if (!canonical || canonical === "." || canonical === requested) return false
   if (isPolicyFile(canonical, projectRoot)) return true
@@ -123,10 +160,48 @@ function numberField(input: Record<string, unknown>, key: string): number | unde
   return typeof value === "number" ? value : undefined
 }
 
-const PATCH_PATH = /^\*\*\* (?:Add File|Update File|Delete File|Move to):\s*(.+?)\s*$/gm
-
 function patchPaths(patchText: string): string[] {
-  return [...patchText.matchAll(PATCH_PATH)].flatMap((match) => match[1] ? [match[1]] : [])
+  const stripped = patchText.trim().match(/^(?:cat\s+)?<<(['"]?)(\w+)\1\s*\n([\s\S]*?)\n\2\s*$/)?.[3] ?? patchText.trim()
+  const lines = stripped.split("\n").map((line) => line.endsWith("\r") ? line.slice(0, -1) : line)
+  const paths: string[] = []
+  const isHeader = (line: string) => line.startsWith("*** Add File: ") || line.startsWith("*** Delete File: ") || line.startsWith("*** Update File: ")
+  const collect = (line: string) => {
+    const header = line.trim()
+    const prefix = ["*** Add File: ", "*** Delete File: ", "*** Update File: "].find((item) => header.startsWith(item))
+    if (prefix) paths.push(header.slice(prefix.length).trim())
+  }
+  const end = lines.at(-1)?.trim() === "*** End Patch" ? lines.length - 1 : lines.length
+  let index = lines[0]?.trim() === "*** Begin Patch" ? 1 : 0
+  while (index < end) {
+    const line = lines[index]
+    const header = line.trim()
+    if (header.startsWith("*** Add File: ")) {
+      collect(line)
+      index++
+      while (index < end && !isHeader(lines[index].trim())) index++
+      continue
+    }
+    if (header.startsWith("*** Delete File: ")) {
+      collect(line)
+      index++
+      continue
+    }
+    if (header.startsWith("*** Update File: ")) {
+      collect(line)
+      index++
+      while (lines[index]?.trimEnd() === "*** End of File") index++
+      const move = lines[index]?.trimEnd()
+      if (move === "*** Move to:" || move?.startsWith("*** Move to: ")) {
+        const destination = move.slice("*** Move to: ".length).trim()
+        if (destination) paths.push(destination)
+        index++
+      }
+      while (index < end && !isHeader(lines[index].trimEnd())) index++
+      continue
+    }
+    index++
+  }
+  return paths
 }
 
 function targetsFor(tool: string, input: Record<string, unknown>, projectRoot: string): PathInfo[] {
@@ -244,7 +319,7 @@ function grepModelContent(matches: GrepMatch[], projectRoot: string, truncated: 
     const earlier = matches[index - 1]
     const previous = earlier ? resolve(projectRoot, earlier.entry.path) : ""
     const lead = display === previous ? [] : [...(previous ? [""] : []), `${display}:`]
-    return [...collected, ...lead, `  Line ${match.line}: ${match.text}`]
+    return [...collected, ...lead, ` Line ${match.line}: ${match.text}`]
   }, header)
   if (!truncated) return lines.join("\n")
   return [
@@ -273,11 +348,11 @@ function filteredResult(result: Tool.Result, output: Tool.Result["output"], cont
   return { ...result, output, content, metadata }
 }
 
-function entryTarget(directory: string, entry: ListEntry): PathInfo {
-  const isDirectory = entry.type === "directory" || entry.path.endsWith("/") || entry.path.endsWith("\\")
+function entryTarget(directory: string, entry: ListEntry, projectRoot: string): PathInfo {
   const name = entry.path.replace(/[\\/]+$/, "")
   const path = directory === "." || directory === "" ? name : `${directory.replace(/\\/g, "/")}/${name}`
-  return { path, kind: isDirectory ? "directory" : "file" }
+  if (entry.type === "directory" || entry.path.endsWith("/") || entry.path.endsWith("\\")) return { path, kind: "directory" }
+  return { path, kind: pathKind(path, projectRoot) }
 }
 
 function filterGlob(result: Tool.Result, ignoreLib: IgnoreLib, projectRoot: string): Tool.Result {
@@ -318,9 +393,9 @@ function filterGrep(result: Tool.Result, ignoreLib: IgnoreLib, projectRoot: stri
 
 function filterRead(result: Tool.Result, input: unknown, ignoreLib: IgnoreLib, projectRoot: string): Tool.Result {
   const page = listPage(result.output)
-  if (!page) return result
+  if (!page) return filterFileRead(result, input, ignoreLib, projectRoot)
   const directory = stringField(inputRecord(input), "path") || "."
-  const entries = page.entries.filter((entry) => !matchesIgnore(ignoreLib, entryTarget(directory, entry), projectRoot))
+  const entries = page.entries.filter((entry) => !matchesIgnore(ignoreLib, entryTarget(directory, entry, projectRoot), projectRoot))
   const filtered = { ...page, entries }
   return filteredResult(
     result,
@@ -328,6 +403,42 @@ function filterRead(result: Tool.Result, input: unknown, ignoreLib: IgnoreLib, p
     listModelContent(directory, numberField(inputRecord(input), "offset"), filtered),
     result.metadata ?? {},
   )
+}
+
+function pathIsIgnored(targetPath: string, ignoreLib: IgnoreLib, projectRoot: string): boolean {
+  const target = { path: targetPath, kind: pathKind(targetPath, projectRoot) }
+  return matchesIgnore(ignoreLib, target, projectRoot)
+}
+
+function fileReadPath(result: Tool.Result, input: unknown): string | undefined {
+  if (isRecord(result.output) && typeof result.output.name === "string") {
+    const requested = stringField(inputRecord(input), "path") || "."
+    return join(dirname(requested), result.output.name)
+  }
+  if (typeof result.content === "string") {
+    return result.content.match(/^Read file ([^,\r\n]+)/)?.[1]
+  }
+  return undefined
+}
+
+function filterFileRead(result: Tool.Result, input: unknown, ignoreLib: IgnoreLib, projectRoot: string): Tool.Result {
+  const actualPath = fileReadPath(result, input)
+  if (!actualPath || !pathIsIgnored(actualPath, ignoreLib, projectRoot)) return result
+  const message = "Access denied: file contents blocked by ignore file. Do NOT try to read this. Access restricted."
+  return { ...result, output: { type: "file", content: message, encoding: "utf8", mime: "text/plain" }, content: message, metadata: {} }
+}
+
+function filterErrorSuggestions(message: string, ignoreLib: IgnoreLib, projectRoot: string): string {
+  const lines = message.split("\n")
+  const marker = lines.findIndex((line) => line.includes("Did you mean"))
+  if (marker < 0) return message
+  const suggestions = lines.slice(marker + 1)
+  const kept = suggestions.filter((line) => {
+    if (!line.trim()) return true
+    return !pathIsIgnored(line.trim(), ignoreLib, projectRoot)
+  })
+  const meaningful = kept.some((line) => line.trim())
+  return [...lines.slice(0, marker), ...(meaningful ? [lines[marker], ...kept] : [])].join("\n")
 }
 
 /**
@@ -357,9 +468,14 @@ const OpenCodeIgnore = Plugin.define({
     })
 
     await ctx.tool.hook("execute.after", async (event) => {
-      if (event.status !== "completed") return
       const ignoreLib = await loadIgnore(projectRoot)
       if (!ignoreLib) return
+      if (event.status === "error") {
+        if (isRecord(event.error) && typeof event.error.message === "string") {
+          event.error.message = filterErrorSuggestions(event.error.message, ignoreLib, projectRoot)
+        }
+        return
+      }
 
       if (event.tool === "glob") {
         event.result = filterGlob(event.result, ignoreLib, projectRoot)
