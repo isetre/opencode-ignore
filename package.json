@@ -54,17 +54,7 @@
   },
   "peerDependencies": {
     "typescript": "^5.9.3",
-    "@opencode/plugin": "^2.2.0",
-    "@opentui/core": "0.7.0",
-    "@opentui/solid": "0.7.0"
-  },
-  "peerDependenciesMeta": {
-    "@opentui/core": {
-      "optional": true
-    },
-    "@opentui/solid": {
-      "optional": true
-    }
+    "@opencode/plugin": "^2.2.0"
   },
   "dependencies": {
     "ignore": "^7.0.5"
