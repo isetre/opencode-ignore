@@ -2,6 +2,8 @@
 
 OpenCode v2 plugin to restrict AI access to files and directories using `.ignore` patterns (gitignore-style).
 
+This repository is a fork of [lgladysz/opencode-ignore](https://github.com/lgladysz/opencode-ignore) by [Łukasz Gładysz](https://github.com/lgladysz). The ignore matching comes from that project. This fork adapts the plugin to OpenCode v2.
+
 > **Disclaimer:** `opencode-ignore` is an independent project. It is not built by the OpenCode team and is not affiliated with OpenCode.
 
 ## Usage
@@ -139,6 +141,8 @@ The plugin protects the following OpenCode v2 native tools. Paths are the `path`
 - `edit` - Blocks editing an ignored file
 - `patch` - Blocks the whole patch when any `*** Add File:`, `*** Update File:`, `*** Move to:`, or `*** Delete File:` path is ignored
 
+The project `.ignore` file is always denied for `read`, `write`, `edit`, `patch`, `glob`, and `grep`, even when no pattern matches it. Glob results, grep matches, and directory listings drop it as well. On Windows, `.Ignore` is the same file. A path is checked as given and, when it is a symlink, at its canonical target. A path that leaves the project is denied.
+
 ### Search (search root blocked before execution, hits removed after)
 - `glob` - Blocks an ignored search directory, then drops ignored files from the result list and the model text
 - `grep` - Blocks an ignored search path, then drops ignored matches. Line previews are rebuilt from the remaining matches, so a removed file's text cannot stay in the model output
@@ -154,10 +158,12 @@ Shell commands are not intercepted. A shell command that prints a file can still
 ## How It Works
 
 ### Pre-execution Protection
-1. Plugin loads `.ignore` file from project root before tool execution
-2. Tool paths are normalized to relative paths from project root
-3. Paths are checked against ignore patterns using the `ignore` library
-4. If matched, tool execution is blocked with clear error message
+1. The root `.ignore` path is denied before pattern matching
+2. Plugin loads `.ignore` from the project root
+3. Tool paths are normalized to relative paths from the project root, and a symlink is also checked at its canonical target
+4. A path that leaves the project is denied
+5. Remaining paths are checked against ignore patterns using the `ignore` library
+6. If matched, tool execution is blocked with a clear error message
 
 ### After-execution filtering (glob, grep, directory read)
 When the search root or directory itself is allowed:
@@ -165,9 +171,10 @@ When the search root or directory itself is allowed:
 2. Ignored paths are removed from the structured result
 3. The model text is rebuilt from what remains, so a line preview or directory name cannot leak
 4. An empty result is reported when every hit was ignored
+5. A truncated glob or grep page keeps its original window size and says that ignored hits were removed
 
 ### Graceful Degradation
-- If `.ignore` missing, all access is allowed
+- If `.ignore` is missing, paths other than the policy file itself are allowed
 - Project root (`.`) is always accessible
 
 ### Error Messages
@@ -219,9 +226,10 @@ bun build index.ts
 
 ## License
 
-MIT
+[MIT](LICENSE). Copyright (c) 2025 Łukasz Gładysz.
 
 ## Related
 
+- [Original opencode-ignore](https://github.com/lgladysz/opencode-ignore) by Łukasz Gładysz
 - [`ignore`](https://github.com/kaelzhang/node-ignore) - The underlying pattern matching library
 - [OpenCode v2 plugins](https://opencode.ai/v2/docs/build/plugins/)

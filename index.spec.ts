@@ -1,4 +1,6 @@
 import { test, expect, describe, beforeAll } from "bun:test"
+import { realpathSync, rmSync, symlinkSync } from "node:fs"
+import { tmpdir } from "node:os"
 import OpenCodeIgnore from "./index"
 import path from "path"
 
@@ -422,6 +424,18 @@ describe("Edge Cases", () => {
     expect(callHook(hook, "read", { path: "" })).resolves.toBeUndefined()
   })
 
+  test("denies a path that leaves the project", async () => {
+    const outside = process.platform === "win32" ? "C:\\Windows\\win.ini" : "/etc/passwd"
+    expect(callHook(hook, "read", { path: "../secrets.json" })).rejects.toThrow(/Access denied/)
+    expect(callHook(hook, "read", { path: "src/../../outside.txt" })).rejects.toThrow(/Access denied/)
+    expect(callHook(hook, "write", { path: outside })).rejects.toThrow(/Access denied/)
+  })
+
+  test("still denies an in-project path that contains a parent segment", async () => {
+    expect(callHook(hook, "read", { path: "src/../secrets.json" }))
+      .rejects.toThrow(/Access denied.*secrets\.json/)
+  })
+
   test("ignores unsupported tools", async () => {
     // Tool that's not in extractPathFromTool should be skipped
     expect(callHook(hook, "unknown_tool", { somePath: "secrets.json" }))
@@ -607,6 +621,44 @@ describe("Glob Tool Result Filtering", () => {
     expect(filtered).toEqual(result)
   })
 
+  test("keeps the original truncation window after ignored hits are removed", async () => {
+    const filtered = await callAfter(afterHook, "glob", { pattern: "**/*" }, {
+      output: [
+        { path: "secrets.json", type: "file" },
+        { path: "credentials.json", type: "file" },
+        { path: "README.md", type: "file" },
+      ],
+      content: "old",
+      metadata: { count: 3, truncated: true },
+    })
+
+    const text = textOf(filtered.content)
+    expect(text).toContain("README.md")
+    expect(text).not.toContain("secrets.json")
+    expect(text).toContain("showing first 3 results")
+    expect(text).toContain("2 ignored hits were removed")
+    expect(text).not.toContain("showing first 1")
+    expect(filtered.metadata?.truncated).toBe(true)
+    expect(filtered.metadata?.count).toBe(1)
+  })
+
+  test("says when a truncated page contained only ignored hits", async () => {
+    const filtered = await callAfter(afterHook, "glob", { pattern: "**/*" }, {
+      output: [
+        { path: "secrets.json", type: "file" },
+        { path: ".env", type: "file" },
+      ],
+      content: "old",
+      metadata: { count: 2, truncated: true },
+    })
+
+    const text = textOf(filtered.content)
+    expect(text).toContain("No files found")
+    expect(text).toContain("showing first 2 results")
+    expect(text).toContain("2 ignored hits were removed")
+    expect(text).not.toContain("showing first 0")
+  })
+
   test("rebuilds string content so a leaked path disappears", async () => {
     const filtered = await callAfter(afterHook, "glob", { pattern: "**/*" }, {
       output: [{ path: "secrets.json", type: "file" }, { path: "README.md", type: "file" }],
@@ -698,7 +750,7 @@ describe("Grep Tool Result Filtering", () => {
     expect(filtered).toEqual(result)
   })
 
-  test("keeps matches without file info", async () => {
+  test("drops grep rows it cannot parse", async () => {
     const pathless = { line: 5, text: "some match without file" }
     const filtered = await callAfter(afterHook, "grep", { pattern: ".*" }, {
       output: [
@@ -706,14 +758,35 @@ describe("Grep Tool Result Filtering", () => {
         pathless,
         match("secrets.json", 3, "password"),
       ],
-      content: "password",
+      content: "password\nsome match without file",
     })
 
     const output = filtered.output as unknown[]
-    expect(output).toHaveLength(2)
+    expect(output).toHaveLength(1)
     expect(output[0]).toMatchObject({ entry: { path: "index.ts" } })
-    expect(output[1]).toEqual(pathless)
+    expect(JSON.stringify(filtered)).not.toContain("some match without file")
     expect(textOf(filtered.content)).not.toContain("password")
+  })
+
+  test("keeps the original truncation window after ignored hits are removed", async () => {
+    const filtered = await callAfter(afterHook, "grep", { pattern: ".*" }, {
+      output: [
+        match("secrets.json", 3, "password"),
+        match("index.ts", 10, "export"),
+        match(".env", 1, "API_KEY"),
+      ],
+      content: "password",
+      metadata: { matches: 3, truncated: true },
+    })
+
+    const text = textOf(filtered.content)
+    expect(text).toContain("export")
+    expect(text).not.toContain("password")
+    expect(text).toContain("showing first 3 results")
+    expect(text).toContain("2 ignored hits were removed")
+    expect(text).not.toContain("showing first 1")
+    expect(filtered.metadata?.truncated).toBe(true)
+    expect(filtered.metadata?.matches).toBe(1)
   })
 
   test("respects negation patterns in grep", async () => {
@@ -736,6 +809,125 @@ describe("Grep Tool Result Filtering", () => {
     const result = { output: [match("secrets.json", 1, "secret")] }
     const filtered = await callAfter(afterHook, "write", {}, result)
     expect(filtered).toEqual(result)
+  })
+})
+
+describe("Policy file", () => {
+  test("denies reading and rewriting .ignore before patterns are applied", async () => {
+    const dir = path.join(tmpdir(), "opencode-ignore-policy-" + Date.now())
+    await Bun.write(path.join(dir, ".ignore"), "secrets.json\n")
+    await Bun.write(path.join(dir, "secrets.json"), "secret")
+    await Bun.write(path.join(dir, "README.md"), "ok")
+    const hooks = await createPlugin(dir)
+
+    await expect(callHook(hooks.before, "read", { path: ".ignore" })).rejects.toThrow(/Access denied.*\.ignore/)
+    await expect(callHook(hooks.before, "write", { path: ".ignore", content: "" })).rejects.toThrow(/Access denied/)
+    await expect(callHook(hooks.before, "edit", { path: ".ignore", oldString: "secrets.json", newString: "!secrets.json" }))
+      .rejects.toThrow(/Access denied/)
+    await expect(callHook(hooks.before, "glob", { path: ".ignore" })).rejects.toThrow(/Access denied/)
+    await expect(callHook(hooks.before, "grep", { path: ".ignore", pattern: "secrets" })).rejects.toThrow(/Access denied/)
+    await expect(callHook(hooks.before, "patch", {
+      patchText: "*** Begin Patch\n*** Update File: .ignore\n-secrets.json\n+!secrets.json\n*** End Patch",
+    })).rejects.toThrow(/Access denied.*\.ignore/)
+    await expect(callHook(hooks.before, "read", { path: "secrets.json" })).rejects.toThrow(/Access denied.*secrets\.json/)
+    await expect(callHook(hooks.before, "read", { path: "README.md" })).resolves.toBeUndefined()
+
+    if (process.platform === "win32") {
+      await expect(callHook(hooks.before, "write", { path: ".Ignore", content: "!secrets.json\n" })).rejects.toThrow(/Access denied/)
+      await expect(callHook(hooks.before, "read", { path: ".IGNORE" })).rejects.toThrow(/Access denied/)
+    }
+
+    const listed = await callAfter(hooks.after, "read", { path: "." }, {
+      output: {
+        type: "list-page",
+        entries: [
+          { path: process.platform === "win32" ? ".Ignore" : ".ignore", type: "file" },
+          { path: "README.md", type: "file" },
+          { path: "secrets.json", type: "file" },
+        ],
+        truncated: false,
+      },
+      content: ".ignore\nsecrets.json\nsecret",
+    })
+    const entries = (listed.output as { entries: { path: string }[] }).entries.map((entry) => entry.path)
+    expect(entries).toEqual(["README.md"])
+    expect(textOf(listed.content)).not.toContain("secret")
+    expect(textOf(listed.content).toLowerCase()).not.toContain(".ignore")
+
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test("hides the policy file from glob and grep results", async () => {
+    const afterHook = (await createPlugin()).after
+    const globbed = await callAfter(afterHook, "glob", { pattern: "**/*" }, {
+      output: [
+        { path: ".ignore", type: "file" },
+        { path: "README.md", type: "file" },
+      ],
+      content: ".ignore\nREADME.md",
+      metadata: { count: 2, truncated: false },
+    })
+    expect((globbed.output as { path: string }[]).map((entry) => entry.path)).toEqual(["README.md"])
+    expect(textOf(globbed.content)).not.toContain(".ignore")
+
+    const grepped = await callAfter(afterHook, "grep", { pattern: "secrets" }, {
+      output: [
+        { entry: { path: ".ignore", type: "file" }, line: 30, offset: 0, text: "secrets.json", submatches: [] },
+        { entry: { path: "README.md", type: "file" }, line: 1, offset: 0, text: "opencode", submatches: [] },
+      ],
+      content: "secrets.json",
+      metadata: { matches: 2, truncated: false },
+    })
+    expect((grepped.output as { entry: { path: string } }[]).map((item) => item.entry.path)).toEqual(["README.md"])
+    expect(JSON.stringify(grepped)).not.toContain("secrets.json")
+  })
+})
+
+describe("Symlink targets", () => {
+  test("denies a link whose canonical target is ignored or outside the project", async () => {
+    const dir = path.join(tmpdir(), "opencode-ignore-link-" + Date.now())
+    const outside = path.join(tmpdir(), "opencode-ignore-outside-" + Date.now())
+    const sensitive = path.join(dir, "sensitive-data")
+    const alias = path.join(dir, "alias")
+    const leak = path.join(dir, "leak")
+    await Bun.write(path.join(dir, ".ignore"), "/sensitive-data/**\n")
+    await Bun.write(path.join(sensitive, "credentials.json"), "secret")
+    await Bun.write(path.join(dir, "README.md"), "ok")
+    await Bun.write(path.join(outside, "secret.txt"), "outside-secret")
+    // File symlinks need an extra privilege on Windows. A directory junction resolves through the same realpath check.
+    if (process.platform === "win32") {
+      symlinkSync(sensitive, alias, "junction")
+      symlinkSync(outside, leak, "junction")
+    } else {
+      symlinkSync(path.join(sensitive, "credentials.json"), alias)
+      symlinkSync(path.join(outside, "secret.txt"), leak)
+    }
+    const hidden = process.platform === "win32" ? "alias/credentials.json" : "alias"
+    const escaped = process.platform === "win32" ? "leak/secret.txt" : "leak"
+    const hooks = await createPlugin(dir)
+
+    await expect(callHook(hooks.before, "read", { path: hidden })).rejects.toThrow(/Access denied/)
+    await expect(callHook(hooks.before, "read", { path: escaped })).rejects.toThrow(/Access denied/)
+    await expect(callHook(hooks.before, "read", { path: "README.md" })).resolves.toBeUndefined()
+    const aliasTarget = process.platform === "win32" ? path.join(alias, "credentials.json") : alias
+    expect(realpathSync(aliasTarget)).toBe(realpathSync(path.join(sensitive, "credentials.json")))
+
+    const filtered = await callAfter(hooks.after, "glob", { pattern: "**/*" }, {
+      output: [
+        { path: hidden, type: "file" },
+        { path: escaped, type: "file" },
+        { path: "README.md", type: "file" },
+      ],
+      content: `${hidden}\n${escaped}\nREADME.md`,
+      metadata: { count: 3, truncated: false },
+    })
+    expect((filtered.output as { path: string }[]).map((entry) => entry.path)).toEqual(["README.md"])
+    expect(textOf(filtered.content)).toContain("README.md")
+    expect(textOf(filtered.content)).not.toContain("credentials.json")
+    expect(textOf(filtered.content)).not.toContain("secret.txt")
+
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(outside, { recursive: true, force: true })
   })
 })
 

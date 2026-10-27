@@ -1,8 +1,7 @@
-import { statSync } from "node:fs"
+import { realpathSync, statSync } from "node:fs"
 import { Plugin } from "@opencode/plugin"
 import type { Tool } from "@opencode/schema/tool"
 import ignore from "ignore"
-import { isPathValid } from "ignore"
 import { isAbsolute, join, relative, resolve } from "path"
 
 /**
@@ -35,8 +34,17 @@ function normalizePath(targetPath: string, projectRoot: string, isDirectory: boo
     ? withoutPrefixPath + "/"
     : withoutPrefixPath
 
-  if (!isPathValid(withSlashPath)) return undefined
+  if (!ignore.isPathValid(withSlashPath)) return undefined
   return withSlashPath
+}
+
+const POLICY_FILE = ".ignore"
+
+function isPolicyFile(targetPath: string, projectRoot: string): boolean {
+  const normalized = normalizePath(targetPath, projectRoot, false)
+  if (!normalized) return false
+  const name = process.platform === "win32" ? normalized.toLowerCase() : normalized
+  return name === POLICY_FILE
 }
 
 type IgnoreLib = ReturnType<typeof ignore>
@@ -62,15 +70,42 @@ function formsFor(kind: PathKind): boolean[] {
   return [false, true]
 }
 
-function isIgnored(ignoreLib: IgnoreLib, targetPath: string, projectRoot: string, isDirectory: boolean): boolean {
-  const normalized = normalizePath(targetPath, projectRoot, isDirectory)
-  if (!normalized || normalized === ".") return false
-  return ignoreLib.ignores(normalized)
+function leavesProject(targetPath: string, kind: PathKind, projectRoot: string): boolean {
+  if (targetPath === "." || targetPath === "") return false
+  return formsFor(kind).every((isDirectory) => normalizePath(targetPath, projectRoot, isDirectory) === undefined)
+}
+
+function ignoredByPattern(ignoreLib: IgnoreLib, targetPath: string, kind: PathKind, projectRoot: string): boolean {
+  return formsFor(kind).some((isDirectory) => {
+    const normalized = normalizePath(targetPath, projectRoot, isDirectory)
+    if (!normalized || normalized === ".") return false
+    return ignoreLib.ignores(normalized)
+  })
+}
+
+function canonicalTarget(targetPath: string, projectRoot: string): string | undefined {
+  if (targetPath === "." || targetPath === "") return undefined
+  const absolute = isAbsolute(targetPath) ? targetPath : join(projectRoot, targetPath)
+  const info = statSync(absolute, { throwIfNoEntry: false })
+  if (!info) return undefined
+  const realTarget = realpathSync(absolute)
+  const realRoot = realpathSync(projectRoot)
+  const relativePath = relative(realRoot, realTarget).replace(/\\/g, "/")
+  return relativePath === "" ? "." : relativePath
 }
 
 function matchesIgnore(ignoreLib: IgnoreLib, target: PathInfo, projectRoot: string): boolean {
   if (target.path === "." || target.path === "") return false
-  return formsFor(target.kind).some((isDirectory) => isIgnored(ignoreLib, target.path, projectRoot, isDirectory))
+  if (isPolicyFile(target.path, projectRoot)) return true
+  if (leavesProject(target.path, target.kind, projectRoot)) return true
+  if (ignoredByPattern(ignoreLib, target.path, target.kind, projectRoot)) return true
+
+  const canonical = canonicalTarget(target.path, projectRoot)
+  const requested = normalizePath(target.path, projectRoot, false)
+  if (!canonical || canonical === "." || canonical === requested) return false
+  if (isPolicyFile(canonical, projectRoot)) return true
+  if (leavesProject(canonical, target.kind, projectRoot)) return true
+  return ignoredByPattern(ignoreLib, canonical, target.kind, projectRoot)
 }
 
 function inputRecord(input: unknown): Record<string, unknown> {
@@ -182,21 +217,27 @@ function listPage(value: unknown): ListPage | undefined {
   }
 }
 
-function modelText(entries: string[], empty: string, truncated: boolean): string {
+function ignoredNote(removed: number): string {
+  if (removed <= 0) return ""
+  if (removed === 1) return " 1 ignored hit was removed."
+  return ` ${removed} ignored hits were removed.`
+}
+
+function modelText(entries: string[], empty: string, truncated: boolean, window: number, removed: number): string {
   const lines = entries.length === 0 ? [empty] : entries
   if (!truncated) return lines.join("\n")
   return [
     ...lines,
     "",
-    `(Results are truncated: showing first ${entries.length} results. Consider using a more specific path or pattern.)`,
+    `(Results are truncated: showing first ${window} results.${ignoredNote(removed)} Consider using a more specific path or pattern.)`,
   ].join("\n")
 }
 
-function globModelContent(entries: GlobEntry[], projectRoot: string, truncated: boolean): string {
-  return modelText(entries.map((entry) => resolve(projectRoot, entry.path)), "No files found", truncated)
+function globModelContent(entries: GlobEntry[], projectRoot: string, truncated: boolean, window: number, removed: number): string {
+  return modelText(entries.map((entry) => resolve(projectRoot, entry.path)), "No files found", truncated, window, removed)
 }
 
-function grepModelContent(matches: GrepMatch[], projectRoot: string, truncated: boolean): string {
+function grepModelContent(matches: GrepMatch[], projectRoot: string, truncated: boolean, window: number, removed: number): string {
   const header = matches.length === 0 ? ["No matches found"] : [`Found ${matches.length} matches`]
   const lines = matches.reduce((collected, match, index) => {
     const display = resolve(projectRoot, match.entry.path)
@@ -209,7 +250,7 @@ function grepModelContent(matches: GrepMatch[], projectRoot: string, truncated: 
   return [
     ...lines,
     "",
-    `(Results are truncated: showing first ${matches.length} results. Consider using a more specific path or pattern.)`,
+    `(Results are truncated: showing first ${window} results.${ignoredNote(removed)} Consider using a more specific path or pattern.)`,
   ].join("\n")
 }
 
@@ -248,27 +289,30 @@ function filterGlob(result: Tool.Result, ignoreLib: IgnoreLib, projectRoot: stri
     return [parsed]
   })
   const truncated = result.metadata?.truncated === true
-  return filteredResult(result, entries, globModelContent(entries, projectRoot, truncated), keptMetadata(result.metadata, "count", entries.length))
+  const window = result.output.length
+  return filteredResult(
+    result,
+    entries,
+    globModelContent(entries, projectRoot, truncated, window, window - entries.length),
+    keptMetadata(result.metadata, "count", entries.length),
+  )
 }
 
 function filterGrep(result: Tool.Result, ignoreLib: IgnoreLib, projectRoot: string): Tool.Result {
   if (!Array.isArray(result.output)) return result
-  const matches = result.output.flatMap((match) => {
+  const kept = result.output.flatMap((match) => {
     const parsed = grepMatch(match)
-    if (!parsed) return [match]
+    if (!parsed) return []
     if (matchesIgnore(ignoreLib, { path: parsed.entry.path, kind: "file" }, projectRoot)) return []
-    return [match]
-  })
-  const parsedMatches = matches.flatMap((match) => {
-    const parsed = grepMatch(match)
-    return parsed ? [parsed] : []
+    return [{ match, parsed }]
   })
   const truncated = result.metadata?.truncated === true
+  const window = result.output.length
   return filteredResult(
     result,
-    matches,
-    grepModelContent(parsedMatches, projectRoot, truncated),
-    keptMetadata(result.metadata, "matches", matches.length),
+    kept.map((item) => item.match),
+    grepModelContent(kept.map((item) => item.parsed), projectRoot, truncated, window, window - kept.length),
+    keptMetadata(result.metadata, "matches", kept.length),
   )
 }
 
@@ -289,9 +333,9 @@ function filterRead(result: Tool.Result, input: unknown, ignoreLib: IgnoreLib, p
 /**
  * OpenCode v2 plugin that blocks native file tools using .ignore patterns.
  *
- * read, write, and edit are denied before execution. glob and grep may search
- * an allowed root, then ignored paths and their previews are removed from the result.
- * patch is denied when any hunk path is ignored.
+ * The root .ignore file is always denied, before pattern matching.
+ * read, write, edit, and patch are denied before execution. glob and grep may
+ * search an allowed root, then ignored paths and their previews are removed.
  */
 const OpenCodeIgnore = Plugin.define({
   id: "opencode-ignore",
@@ -299,11 +343,14 @@ const OpenCodeIgnore = Plugin.define({
     const projectRoot = ctx.location.directory
 
     await ctx.tool.hook("execute.before", async (event) => {
+      const targets = targetsFor(event.tool, inputRecord(event.input), projectRoot)
+      const policy = targets.find((target) => isPolicyFile(target.path, projectRoot))
+      if (policy) throw new Error(denied(policy.path))
+
       const ignoreLib = await loadIgnore(projectRoot)
       if (!ignoreLib) return
 
-      const blocked = targetsFor(event.tool, inputRecord(event.input), projectRoot)
-        .find((target) => matchesIgnore(ignoreLib, target, projectRoot))
+      const blocked = targets.find((target) => matchesIgnore(ignoreLib, target, projectRoot))
       if (!blocked) return
 
       throw new Error(denied(blocked.path))
