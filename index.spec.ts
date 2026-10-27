@@ -573,12 +573,14 @@ ${header.startsWith("*** Add") ? "+hello" : ""}
     }
   })
 
-  // OpenCode's update-hunk parser only trims line ends, so an indented marker there is hunk content, not a move or header.
-  // If the host starts trimming these lines, this test must flip to expect a denial.
-  test("treats indented markers inside an update hunk as content, like the host", async () => {
+  test("blocks indented markers inside an update hunk even though the host trims only line ends", async () => {
     await expect(callHook(hook, "patch", {
-      patchText: "*** Begin Patch\n*** Update File: README.md\n *** Move to: secrets.json\n@@\n-old\n+new\n *** Update File: .env\n*** End Patch",
-    })).resolves.toBeUndefined()
+      patchText: "*** Begin Patch\n*** Update File: README.md\n *** Move to: secrets.json\n@@\n-old\n+new\n*** End Patch",
+    })).rejects.toThrow(/Access denied.*secrets\.json/)
+
+    await expect(callHook(hook, "patch", {
+      patchText: "*** Begin Patch\n*** Update File: README.md\n@@\n-old\n+new\n *** Update File: .env\n*** End Patch",
+    })).rejects.toThrow(/Access denied.*\.env/)
   })
 
   test("blocks grep of an ignored file path", async () => {
@@ -1112,6 +1114,18 @@ describe("Read Directory Result Filtering", () => {
     expect(textOf(filtered?.content)).toContain("Access denied")
     expect(JSON.stringify(filtered)).not.toContain("secret")
     expect(JSON.stringify(filtered)).not.toContain("team's-key.json")
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test("removes a sensitive completed file read whose name contains a comma", async () => {
+    const dir = path.join(tmpdir(), "opencode-ignore-read-comma-" + Date.now())
+    await Bun.write(path.join(dir, ".ignore"), "secret, copy.json\n")
+    const filtered = await callAfter((await createPlugin(dir)).after, "read", { path: "secret, copy.json" }, {
+      output: { type: "file", content: "secret", encoding: "utf8", mime: "text/plain" },
+      content: "Read file secret, copy.json, lines 1-1\nsecret",
+    })
+    expect(textOf(filtered.content)).toContain("Access denied")
+    expect(JSON.stringify(filtered)).not.toContain("secret, copy.json")
     rmSync(dir, { recursive: true, force: true })
   })
 

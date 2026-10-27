@@ -138,10 +138,11 @@ function realPathOf(absolute: string, hops = 0): string | null {
   return realParent && join(realParent, basename(absolute))
 }
 
-function canonicalTarget(targetPath: string, projectRoot: string): string | undefined | null {
-  if (targetPath === "." || targetPath === "") return undefined
-  const absolute = isAbsolute(targetPath) ? targetPath : join(projectRoot, targetPath)
-  const realTarget = realPathOf(absolute)
+const realRoots = new Map<string, string>()
+
+function realRootOf(projectRoot: string): string | null {
+  const cached = realRoots.get(projectRoot)
+  if (cached) return cached
   const realRoot = (() => {
     try {
       return realpathSync(projectRoot)
@@ -149,6 +150,15 @@ function canonicalTarget(targetPath: string, projectRoot: string): string | unde
       return null
     }
   })()
+  if (realRoot) realRoots.set(projectRoot, realRoot)
+  return realRoot
+}
+
+function canonicalTarget(targetPath: string, projectRoot: string): string | undefined | null {
+  if (targetPath === "." || targetPath === "") return undefined
+  const absolute = isAbsolute(targetPath) ? targetPath : join(projectRoot, targetPath)
+  const realTarget = realPathOf(absolute)
+  const realRoot = realRootOf(projectRoot)
   if (!realTarget || !realRoot) return null
   const relativePath = relative(realRoot, realTarget).replace(/\\/g, "/")
   return relativePath === "" ? "." : relativePath
@@ -214,14 +224,14 @@ function patchPaths(patchText: string): string[] {
     if (header.startsWith("*** Update File: ")) {
       collect(line)
       index++
-      while (lines[index]?.trimEnd() === "*** End of File") index++
-      const move = lines[index]?.trimEnd()
+      while (lines[index]?.trim() === "*** End of File") index++
+      const move = lines[index]?.trim()
       if (move === "*** Move to:" || move?.startsWith("*** Move to: ")) {
         const destination = move.slice("*** Move to: ".length).trim()
         if (destination) paths.push(destination)
         index++
       }
-      while (index < end && !isHeader((lines[index] ?? "").trimEnd())) index++
+      while (index < end && !isHeader((lines[index] ?? "").trim())) index++
       continue
     }
     index++
@@ -323,6 +333,11 @@ function ignoredNote(removed: number): string {
   return ` ${removed} ignored hits were removed.`
 }
 
+/*
+ * The model text rebuilt below, and the "Read file" header parsed in fileReadPath,
+ * copy the layout of OpenCode 2.2.0's glob, grep, and read tools. Recheck them
+ * against the host whenever the @opencode/plugin version changes.
+ */
 function modelText(entries: string[], empty: string, truncated: boolean, window: number, removed: number): string {
   const lines = entries.length === 0 ? [empty] : entries
   if (!truncated) return lines.join("\n")
@@ -441,7 +456,7 @@ function fileReadPath(result: Tool.Result, input: unknown): string | undefined {
     return join(dirname(requested), result.output.name)
   }
   if (typeof result.content === "string") {
-    return result.content.match(/^Read file ([^,\r\n]+)/)?.[1]
+    return result.content.match(/^Read file ([^\r\n]+?)(?:, lines \d[^\r\n]*)?$/m)?.[1]
   }
   return undefined
 }
