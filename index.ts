@@ -356,11 +356,11 @@ function entryTarget(directory: string, entry: ListEntry, projectRoot: string): 
 }
 
 function filterGlob(result: Tool.Result, ignoreLib: IgnoreLib, projectRoot: string): Tool.Result {
-  if (!Array.isArray(result.output)) return result
+  if (!Array.isArray(result.output)) return filteredResult(result, [], "No files found", keptMetadata(result.metadata, "count", 0))
   const entries = result.output.flatMap((entry) => {
     const parsed = globEntry(entry)
     if (!parsed) return []
-    if (matchesIgnore(ignoreLib, { path: parsed.path, kind: "file" }, projectRoot)) return []
+    if (matchesIgnore(ignoreLib, entryTarget(".", parsed, projectRoot), projectRoot)) return []
     return [parsed]
   })
   const truncated = result.metadata?.truncated === true
@@ -374,7 +374,7 @@ function filterGlob(result: Tool.Result, ignoreLib: IgnoreLib, projectRoot: stri
 }
 
 function filterGrep(result: Tool.Result, ignoreLib: IgnoreLib, projectRoot: string): Tool.Result {
-  if (!Array.isArray(result.output)) return result
+  if (!Array.isArray(result.output)) return filteredResult(result, [], "No matches found", keptMetadata(result.metadata, "matches", 0))
   const kept = result.output.flatMap((match) => {
     const parsed = grepMatch(match)
     if (!parsed) return []

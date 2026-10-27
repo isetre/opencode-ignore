@@ -568,6 +568,14 @@ ${header.startsWith("*** Add") ? "+hello" : ""}
     }
   })
 
+  // OpenCode's update-hunk parser only trims line ends, so an indented marker there is hunk content, not a move or header.
+  // If the host starts trimming these lines, this test must flip to expect a denial.
+  test("treats indented markers inside an update hunk as content, like the host", async () => {
+    await expect(callHook(hook, "patch", {
+      patchText: "*** Begin Patch\n*** Update File: README.md\n *** Move to: secrets.json\n@@\n-old\n+new\n *** Update File: .env\n*** End Patch",
+    })).resolves.toBeUndefined()
+  })
+
   test("blocks grep of an ignored file path", async () => {
     expect(callHook(hook, "grep", { pattern: "password", path: "secrets.json" }))
       .rejects.toThrow(/Access denied.*secrets\.json/)
@@ -628,10 +636,14 @@ describe("Glob Tool Result Filtering", () => {
     expect(filtered.output).toEqual([])
   })
 
-  test("handles malformed glob results gracefully", async () => {
-    const result = { output: { files: null } }
-    const filtered = await callAfter(afterHook, "glob", { pattern: "**/*" }, result)
-    expect(filtered).toEqual(result)
+  test("drops glob results with an unexpected shape", async () => {
+    const filtered = await callAfter(afterHook, "glob", { pattern: "**/*" }, {
+      output: { files: ["secrets.json"] },
+      content: "secrets.json",
+    })
+    expect(filtered.output).toEqual([])
+    expect(textOf(filtered.content)).toBe("No files found")
+    expect(filtered.metadata?.count).toBe(0)
   })
 
   test("respects negation patterns", async () => {
@@ -735,6 +747,16 @@ describe("Grep Tool Result Filtering", () => {
     expect(filtered.metadata?.matches).toBe(2)
   })
 
+  test("drops grep results with an unexpected shape", async () => {
+    const filtered = await callAfter(afterHook, "grep", { pattern: ".*" }, {
+      output: { matches: [match("secrets.json", 3, "password")] },
+      content: "secrets.json:\n  Line 3: password",
+    })
+    expect(filtered.output).toEqual([])
+    expect(textOf(filtered.content)).toBe("No matches found")
+    expect(filtered.metadata?.matches).toBe(0)
+  })
+
   test("does not leak any info about blocked files", async () => {
     const filtered = await callAfter(afterHook, "grep", { pattern: ".*" }, {
       output: [
@@ -774,12 +796,6 @@ describe("Grep Tool Result Filtering", () => {
       content: "No matches found",
     })
     expect(filtered.output).toEqual([])
-  })
-
-  test("handles malformed grep results gracefully", async () => {
-    const result = { output: { matches: null } }
-    const filtered = await callAfter(afterHook, "grep", { pattern: "test" }, result)
-    expect(filtered).toEqual(result)
   })
 
   test("drops grep rows it cannot parse", async () => {
@@ -960,6 +976,34 @@ describe("Symlink targets", () => {
 
     rmSync(dir, { recursive: true, force: true })
     rmSync(outside, { recursive: true, force: true })
+  })
+
+  test("removes directory glob hits and directory links matched by a trailing-slash pattern", async () => {
+    const dir = path.join(tmpdir(), "opencode-ignore-glob-dir-" + Date.now())
+    const target = path.join(dir, "secret-dir")
+    const alias = path.join(dir, "alias")
+    await Bun.write(path.join(dir, ".ignore"), "secret-dir/\n")
+    await Bun.write(path.join(target, "secret.txt"), "secret")
+    await Bun.write(path.join(dir, "README.md"), "ok")
+    symlinkSync(target, alias, process.platform === "win32" ? "junction" : "dir")
+
+    const filtered = await callAfter((await createPlugin(dir)).after, "glob", { pattern: "**/*" }, {
+      output: [
+        { path: "secret-dir", type: "directory" },
+        { path: "secret-dir" },
+        { path: "alias", type: "symlink" },
+        { path: "alias/secret.txt", type: "file" },
+        { path: "README.md", type: "file" },
+      ],
+      content: "secret-dir\nsecret-dir\nalias\nalias/secret.txt\nREADME.md",
+      metadata: { count: 5, truncated: false },
+    })
+
+    expect((filtered.output as { path: string }[]).map((entry) => entry.path)).toEqual(["README.md"])
+    expect(textOf(filtered.content)).not.toContain("alias")
+    expect(textOf(filtered.content)).not.toContain("secret-dir")
+    expect(filtered.metadata?.count).toBe(1)
+    rmSync(dir, { recursive: true, force: true })
   })
 })
 
