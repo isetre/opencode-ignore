@@ -1,8 +1,8 @@
-import { realpathSync, statSync } from "node:fs"
+import { lstatSync, readlinkSync, realpathSync, statSync } from "node:fs"
 import { Plugin } from "@opencode/plugin"
 import type { Tool } from "@opencode/schema/tool"
 import ignore from "ignore"
-import { dirname, isAbsolute, join, relative, resolve } from "path"
+import { basename, dirname, isAbsolute, join, relative, resolve } from "path"
 
 /**
  * Load ignore patterns from project root.
@@ -98,9 +98,15 @@ function ignoredByPattern(ignoreLib: IgnoreLib, targetPath: string, kind: PathKi
   })
 }
 
-function canonicalTarget(targetPath: string, projectRoot: string): string | undefined | null {
-  if (targetPath === "." || targetPath === "") return undefined
-  const absolute = isAbsolute(targetPath) ? targetPath : join(projectRoot, targetPath)
+const MAX_LINK_HOPS = 40
+
+/**
+ * Real path of a target that may not exist yet. A missing path is resolved
+ * through its nearest existing parent, and a dangling link through its target,
+ * so a new file under a linked folder is checked where it will be written.
+ */
+function realPathOf(absolute: string, hops = 0): string | null {
+  if (hops > MAX_LINK_HOPS) return null
   const info = (() => {
     try {
       return statSync(absolute, { throwIfNoEntry: false })
@@ -109,14 +115,33 @@ function canonicalTarget(targetPath: string, projectRoot: string): string | unde
     }
   })()
   if (info === null) return null
-  if (!info) return undefined
-  const realTarget = (() => {
+  if (info) {
     try {
       return realpathSync(absolute)
     } catch {
       return null
     }
+  }
+  const link = (() => {
+    try {
+      const entry = lstatSync(absolute, { throwIfNoEntry: false })
+      return entry?.isSymbolicLink() ? readlinkSync(absolute) : undefined
+    } catch {
+      return null
+    }
   })()
+  if (link === null) return null
+  if (link !== undefined) return realPathOf(resolve(dirname(absolute), link), hops + 1)
+  const parent = dirname(absolute)
+  if (parent === absolute) return null
+  const realParent = realPathOf(parent, hops)
+  return realParent && join(realParent, basename(absolute))
+}
+
+function canonicalTarget(targetPath: string, projectRoot: string): string | undefined | null {
+  if (targetPath === "." || targetPath === "") return undefined
+  const absolute = isAbsolute(targetPath) ? targetPath : join(projectRoot, targetPath)
+  const realTarget = realPathOf(absolute)
   const realRoot = (() => {
     try {
       return realpathSync(projectRoot)
@@ -173,12 +198,12 @@ function patchPaths(patchText: string): string[] {
   const end = lines.at(-1)?.trim() === "*** End Patch" ? lines.length - 1 : lines.length
   let index = lines[0]?.trim() === "*** Begin Patch" ? 1 : 0
   while (index < end) {
-    const line = lines[index]
+    const line = lines[index] ?? ""
     const header = line.trim()
     if (header.startsWith("*** Add File: ")) {
       collect(line)
       index++
-      while (index < end && !isHeader(lines[index].trim())) index++
+      while (index < end && !isHeader((lines[index] ?? "").trim())) index++
       continue
     }
     if (header.startsWith("*** Delete File: ")) {
@@ -196,7 +221,7 @@ function patchPaths(patchText: string): string[] {
         if (destination) paths.push(destination)
         index++
       }
-      while (index < end && !isHeader(lines[index].trimEnd())) index++
+      while (index < end && !isHeader((lines[index] ?? "").trimEnd())) index++
       continue
     }
     index++

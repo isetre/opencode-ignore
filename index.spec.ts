@@ -50,12 +50,17 @@ async function createPlugin(projectRoot = TEST_PROJECT_ROOT): Promise<Hooks> {
   return { before: hooks.before, after: hooks.after }
 }
 
-async function callAfter(hook: Hooks["after"], tool: string, input: Record<string, unknown>, result: ToolResult, error?: Error) {
-  const event: AfterEvent = error
-    ? { tool, input, status: "error", error }
-    : { tool, input, status: "completed", result }
+async function callAfter(hook: Hooks["after"], tool: string, input: Record<string, unknown>, result: ToolResult): Promise<ToolResult> {
+  const event: AfterEvent = { tool, input, status: "completed", result }
   await hook(event)
-  return error ? event : event.result
+  if (!event.result) throw new Error("after hook removed the result")
+  return event.result
+}
+
+async function callAfterError(hook: Hooks["after"], tool: string, input: Record<string, unknown>, error: Error): Promise<AfterEvent> {
+  const event: AfterEvent = { tool, input, status: "error", error }
+  await hook(event)
+  return event
 }
 
 function textOf(content: ToolResult["content"]): string {
@@ -978,6 +983,34 @@ describe("Symlink targets", () => {
     rmSync(outside, { recursive: true, force: true })
   })
 
+  test("denies creating a new file through a linked folder", async () => {
+    const dir = path.join(tmpdir(), "opencode-ignore-link-new-" + Date.now())
+    const outside = path.join(tmpdir(), "opencode-ignore-link-new-outside-" + Date.now())
+    const secrets = path.join(dir, "secrets")
+    await Bun.write(path.join(dir, ".ignore"), "/secrets/**\n")
+    await Bun.write(path.join(secrets, "existing.txt"), "secret")
+    await Bun.write(path.join(outside, "existing.txt"), "outside")
+    const linkType = process.platform === "win32" ? "junction" : "dir"
+    symlinkSync(secrets, path.join(dir, "alias"), linkType)
+    symlinkSync(outside, path.join(dir, "leak"), linkType)
+    symlinkSync(path.join(secrets, "later"), path.join(dir, "pending"), linkType)
+    const hooks = await createPlugin(dir)
+
+    await expect(callHook(hooks.before, "write", { path: "secrets/new.txt" })).rejects.toThrow(/Access denied/)
+    await expect(callHook(hooks.before, "write", { path: "alias/new.txt" })).rejects.toThrow(/Access denied/)
+    await expect(callHook(hooks.before, "write", { path: "alias/nested/deep/new.txt" })).rejects.toThrow(/Access denied/)
+    await expect(callHook(hooks.before, "write", { path: "leak/new.txt" })).rejects.toThrow(/Access denied/)
+    await expect(callHook(hooks.before, "write", { path: "pending/new.txt" })).rejects.toThrow(/Access denied/)
+    await expect(callHook(hooks.before, "patch", {
+      patchText: "*** Begin Patch\n*** Add File: alias/new.txt\n+stolen\n*** End Patch",
+    })).rejects.toThrow(/Access denied/)
+    await expect(callHook(hooks.before, "write", { path: "notes/new.txt" })).resolves.toBeUndefined()
+    await expect(callHook(hooks.before, "write", { path: "README.md" })).resolves.toBeUndefined()
+
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(outside, { recursive: true, force: true })
+  })
+
   test("removes directory glob hits and directory links matched by a trailing-slash pattern", async () => {
     const dir = path.join(tmpdir(), "opencode-ignore-glob-dir-" + Date.now())
     const target = path.join(dir, "secret-dir")
@@ -1113,7 +1146,7 @@ describe("Completed read and error filtering", () => {
     const hooks = await createPlugin(dir)
     await expect(callHook(hooks.before, "read", { path: "team’s-key.json" })).rejects.toThrow(/Access denied/)
     const error = new Error("File not found: secret.json\n\nDid you mean one of these?\nsecrets.json\nREADME.md")
-    const result = await callAfter(hooks.after, "read", { path: "secret.json" }, {}, error)
+    const result = await callAfterError(hooks.after, "read", { path: "secret.json" }, error)
     expect(result.error?.message).not.toContain("secrets.json")
     expect(result.error?.message).toContain("README.md")
     rmSync(dir, { recursive: true, force: true })
