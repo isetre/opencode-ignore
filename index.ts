@@ -483,7 +483,7 @@ function filterErrorSuggestions(message: string, ignoreLib: IgnoreLib, projectRo
  * search an allowed root, then ignored paths and their previews are removed.
  */
 const OpenCodeIgnore = Plugin.define({
-  id: "opencode-ignore",
+  id: "opencode2-ignore",
   async setup(ctx) {
     const projectRoot = ctx.location.directory
 

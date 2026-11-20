@@ -1,10 +1,10 @@
-# opencode-ignore
+# opencode2-ignore
 
 OpenCode v2 plugin to restrict AI access to files and directories using `.ignore` patterns (gitignore-style).
 
 This repository is a fork of [lgladysz/opencode-ignore](https://github.com/lgladysz/opencode-ignore) by [Łukasz Gładysz](https://github.com/lgladysz). The ignore matching comes from that project. This fork adapts the plugin to OpenCode v2.
 
-> **Disclaimer:** `opencode-ignore` is an independent project. It is not built by the OpenCode team and is not affiliated with OpenCode.
+> **Disclaimer:** `opencode2-ignore` is an independent project. It is not built by the OpenCode team and is not affiliated with OpenCode.
 
 ## Usage
 
@@ -14,7 +14,7 @@ Add to your OpenCode configuration (`~/.config/opencode/opencode.json`):
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
-    "opencode-ignore"
+    "opencode2-ignore"
   ]
 }
 ```
@@ -226,7 +226,7 @@ bun build index.ts
 
 ## License
 
-[MIT](LICENSE). Copyright (c) 2025 Łukasz Gładysz.
+[MIT](LICENSE). Copyright (c) 2025 Łukasz Gładysz, 2026 isetre.
 
 ## Related
 

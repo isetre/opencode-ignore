@@ -1,6 +1,6 @@
 # Test Directory Structure for Security Plugin Testing
 
-Complete test suite for validating the opencode-ignore plugin with realistic sensitive and non-sensitive files.
+Complete test suite for validating the opencode2-ignore plugin with realistic sensitive and non-sensitive files.
 
 **This directory is the test project root.** All patterns in `.ignore` are relative to this directory.
 

@@ -1,13 +1,13 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
-  "name": "opencode-ignore",
+  "name": "opencode2-ignore",
   "version": "2.0.0",
   "description": "Ignore plugin for OpenCode v2",
   "type": "module",
   "license": "MIT",
-  "author": "Łukasz Gładysz",
+  "author": "isetre",
   "contributors": [
-    "isetre"
+    "Łukasz Gładysz"
   ],
   "packageManager": "bun@1.3.1",
   "repository": {

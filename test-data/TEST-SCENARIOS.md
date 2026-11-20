@@ -1,6 +1,6 @@
 # Security Plugin Test Scenarios
 
-Complete test suite for validating opencode-ignore plugin behavior.
+Complete test suite for validating opencode2-ignore plugin behavior.
 
 **Entry Point**: All tests run from this directory (test-data/). This IS the project root for testing.
 
